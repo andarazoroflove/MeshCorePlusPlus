@@ -30,6 +30,7 @@ void objc_registerClassPair(Class cls);
 
 // Dynamic loader & GCD ABI
 void* dlopen(const char* path, int mode);
+void* dlsym(void* handle, const char* symbol);
 typedef struct dispatch_queue_s* dispatch_queue_t;
 typedef struct dispatch_queue_attr_s* dispatch_queue_attr_t;
 dispatch_queue_t dispatch_queue_create(const char* label, dispatch_queue_attr_t attr);

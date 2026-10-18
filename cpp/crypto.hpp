@@ -445,6 +445,66 @@ inline bool try_encode_mono_rle_bits(const uint8_t px[MONO_IMG_PIXELS],
     return true;
 }
 
+inline bool try_encode_mono_2x2_rle_bits(const uint8_t blk_pat[360],
+                                         uint8_t out_bitbuf[MONO_IMG_WIRE_BITS],
+                                         size_t* out_bits_used = nullptr) noexcept {
+    std::memset(out_bitbuf, 0, MONO_IMG_WIRE_BITS);
+    size_t pos = 0;
+    auto put_bits = [&](uint32_t val, size_t nbits) noexcept -> bool {
+        if (pos + nbits > MONO_IMG_WIRE_BITS) return false;
+        for (size_t b = 0; b < nbits; ++b) {
+            out_bitbuf[pos++] = static_cast<uint8_t>((val >> (nbits - 1 - b)) & 1u);
+        }
+        return true;
+    };
+
+    // Mode 1 header bit
+    if (!put_bits(1u, 1)) return false;
+
+    size_t bidx = 0;
+    while (bidx < 360) {
+        uint8_t p = blk_pat[bidx] & 0x0Fu;
+        if (p == 0b0000u || p == 0b1111u) {
+            uint32_t color = (p == 0b1111u) ? 1u : 0u;
+            size_t run = 1;
+            while (bidx + run < 360 && (blk_pat[bidx + run] & 0x0Fu) == p) {
+                ++run;
+            }
+            bidx += run;
+
+            // Token: 0 (solid run) + color (1b) + prefix-coded run length
+            if (!put_bits(0u, 1) || !put_bits(color, 1)) return false;
+            if (run == 1) {
+                if (!put_bits(0u, 1)) return false;
+            } else if (run <= 5) {
+                if (!put_bits(0b10u, 2) || !put_bits(static_cast<uint32_t>(run - 2), 2)) return false;
+            } else if (run <= 21) {
+                if (!put_bits(0b110u, 3) || !put_bits(static_cast<uint32_t>(run - 6), 4)) return false;
+            } else {
+                if (!put_bits(0b111u, 3) || !put_bits(static_cast<uint32_t>(run), 9)) return false;
+            }
+        } else {
+            // Non-solid 2x2 block (p in 1..14)
+            // Escape code 0b1111 after '1' encodes a pair of consecutive 2-pixel dither blocks
+            bool cur_dither = (p == 0b1001u || p == 0b0110u);
+            if (cur_dither && bidx + 1 < 360) {
+                uint8_t p_next = blk_pat[bidx + 1] & 0x0Fu;
+                if (p_next == 0b1001u || p_next == 0b0110u) {
+                    if (!put_bits(1u, 1) || !put_bits(0b1111u, 4)) return false;
+                    bidx += 2;
+                    continue;
+                }
+            }
+            // Exact 4-bit 2x2 sub-block pattern (tl, tr, bl, br)
+            if (!put_bits(1u, 1) || !put_bits(p, 4)) return false;
+            ++bidx;
+        }
+    }
+
+    if (out_bits_used) *out_bits_used = pos;
+    return true;
+}
+
 inline std::string encode_mono_img_companion_wire(const std::array<uint8_t, MONO_IMG_BYTES>& bits) noexcept {
     uint8_t px[MONO_IMG_PIXELS];
     for (size_t i = 0; i < MONO_IMG_PIXELS; ++i) {
@@ -458,18 +518,7 @@ inline std::string encode_mono_img_companion_wire(const std::array<uint8_t, MONO
     }
 
     if (!rle_ok) {
-        // Mode 1: 48x30 (24x15 2x2 blocks) Complete Prefix-Free Density + Sub-Block Orientation Codec
-        std::memset(bitbuf, 0, sizeof(bitbuf));
-        size_t pos = 0;
-        auto put_bits = [&](uint32_t val, size_t nbits) noexcept {
-            for (size_t b = 0; b < nbits && pos < MONO_IMG_WIRE_BITS; ++b) {
-                bitbuf[pos++] = static_cast<uint8_t>((val >> (nbits - 1 - b)) & 1u);
-            }
-        };
-
-        put_bits(1u, 1); // Mode 1
-
-        uint8_t blk_density[360]{};
+        // Mode 1: 48x30 Exact 2x2 Pattern + Solid-Run Codec with structure-preserving rate-distortion fit
         uint8_t blk_pat[360]{};
         for (size_t by = 0; by < 15; ++by) {
             for (size_t bx = 0; bx < 24; ++bx) {
@@ -478,43 +527,51 @@ inline std::string encode_mono_img_companion_wire(const std::array<uint8_t, MONO
                 uint8_t tr = px[(by * 2) * MONO_IMG_W + (bx * 2 + 1)];
                 uint8_t bl = px[(by * 2 + 1) * MONO_IMG_W + (bx * 2)];
                 uint8_t br = px[(by * 2 + 1) * MONO_IMG_W + (bx * 2 + 1)];
-                uint8_t sum = static_cast<uint8_t>(tl + tr + bl + br);
                 blk_pat[bidx] = static_cast<uint8_t>((tl << 3) | (tr << 2) | (bl << 1) | br);
-
-                size_t rem_after = 359 - bidx;
-                bool can_3bit = (pos + 3 + rem_after * 2 <= MONO_IMG_WIRE_BITS);
-                if ((sum == 1 || sum == 3) && !can_3bit) {
-                    bool phase = ((bx + by) & 1u) != 0;
-                    sum = (sum == 1) ? (phase ? 2 : 0) : (phase ? 4 : 2);
-                }
-                blk_density[bidx] = sum;
-
-                if (sum == 0)      put_bits(0b00u, 2);
-                else if (sum == 4) put_bits(0b01u, 2);
-                else if (sum == 2) put_bits(0b10u, 2);
-                else if (sum == 1) put_bits(0b110u, 3);
-                else               put_bits(0b111u, 3);
             }
         }
 
-        // Sub-block 2x2 orientation refinement using remaining bits up to 780
-        for (size_t bidx = 0; bidx < 360 && pos + 2 <= MONO_IMG_WIRE_BITS; ++bidx) {
-            uint8_t d = blk_density[bidx];
-            uint8_t pat = blk_pat[bidx];
-            if (d == 2) {
-                // 00 = diagonal dither, 01 = top edge (1100), 10 = bottom edge (0011), 11 = vertical edge (1010/0101)
-                uint32_t code = 0;
-                if (pat == 0b1100) code = 1;
-                else if (pat == 0b0011) code = 2;
-                else if (pat == 0b1010 || pat == 0b0101) code = 3;
-                put_bits(code, 2);
-            } else if (d == 1) {
-                uint32_t p = (pat & 0b1000) ? 0u : (pat & 0b0100) ? 1u : (pat & 0b0010) ? 2u : 3u;
-                put_bits(p, 2);
-            } else if (d == 3) {
-                uint32_t z = !(pat & 0b1000) ? 0u : !(pat & 0b0100) ? 1u : !(pat & 0b0010) ? 2u : 3u;
-                put_bits(z, 2);
+        // Iteratively coalesce lowest-salience isolated dither speckles until the exact 4-bit pattern
+        // stream fits cleanly within the 780-bit single-packet budget.
+        for (int iter = 0; iter < 360 && !try_encode_mono_2x2_rle_bits(blk_pat, bitbuf); ++iter) {
+            int best_idx = -1;
+            int best_cost = 999999;
+            uint8_t best_replacement = 0;
+
+            for (size_t bidx = 0; bidx < 360; ++bidx) {
+                uint8_t p = blk_pat[bidx] & 0x0Fu;
+                uint8_t prev_p = (bidx > 0) ? (blk_pat[bidx - 1] & 0x0Fu) : 0xFFu;
+                uint8_t next_p = (bidx + 1 < 360) ? (blk_pat[bidx + 1] & 0x0Fu) : 0xFFu;
+
+                if (p != 0b0000u && p != 0b1111u) {
+                    uint8_t sum = static_cast<uint8_t>(((p >> 3) & 1u) + ((p >> 2) & 1u) + ((p >> 1) & 1u) + (p & 1u));
+                    uint8_t target_solid = (sum >= 3) ? 0b1111u : (sum <= 1) ? 0b0000u
+                                         : (prev_p == 0b1111u || next_p == 0b1111u) ? 0b1111u : 0b0000u;
+                    int dist = (sum == 1 || sum == 3) ? 10 : 28; // Prefer 1-pixel speckles over 2-pixel edges
+                    // Preserve horizontal/vertical edges (1100, 0011, 1010, 0101) over diagonal dither (1001, 0110)
+                    if (p == 0b1001u || p == 0b0110u) dist -= 6;
+                    // Strong bonus if snapping merges into an adjacent solid run
+                    if (prev_p == target_solid && next_p == target_solid) dist -= 9;
+                    else if (prev_p == target_solid || next_p == target_solid) dist -= 5;
+
+                    if (dist < best_cost) {
+                        best_cost = dist;
+                        best_idx = static_cast<int>(bidx);
+                        best_replacement = target_solid;
+                    }
+                } else if (prev_p == next_p && (prev_p == 0b0000u || prev_p == 0b1111u) && p != prev_p) {
+                    // Isolated 1-block solid island between two identical solid runs
+                    int dist = 35;
+                    if (dist < best_cost) {
+                        best_cost = dist;
+                        best_idx = static_cast<int>(bidx);
+                        best_replacement = prev_p;
+                    }
+                }
             }
+
+            if (best_idx < 0) break;
+            blk_pat[best_idx] = best_replacement;
         }
     }
 
@@ -594,43 +651,46 @@ inline bool decode_mono_img_companion_wire(const uint8_t* data,
             }
         }
     } else {
-        uint8_t blk_density[360]{};
-        for (size_t bidx = 0; bidx < 360; ++bidx) {
-            uint32_t b0 = get_bits(1);
-            uint32_t b1 = get_bits(1);
-            if (b0 == 0 && b1 == 0)      blk_density[bidx] = 0;
-            else if (b0 == 0 && b1 == 1) blk_density[bidx] = 4;
-            else if (b0 == 1 && b1 == 0) blk_density[bidx] = 2;
-            else                         blk_density[bidx] = (get_bits(1) == 0) ? 1 : 3;
+        uint8_t blk_pat[360]{};
+        size_t bidx = 0;
+        while (bidx < 360 && pos < MONO_IMG_WIRE_BITS) {
+            uint32_t tok = get_bits(1);
+            if (tok == 0) {
+                uint32_t color = get_bits(1);
+                uint8_t pat = color ? 0b1111u : 0b0000u;
+                size_t run = 1;
+                if (get_bits(1) == 0) {
+                    run = 1;
+                } else if (get_bits(1) == 0) {
+                    run = 2 + get_bits(2);
+                } else if (get_bits(1) == 0) {
+                    run = 6 + get_bits(4);
+                } else {
+                    run = get_bits(9);
+                    if (run == 0) break;
+                }
+                size_t end = std::min<size_t>(360, bidx + run);
+                for (; bidx < end; ++bidx) {
+                    blk_pat[bidx] = pat;
+                }
+            } else {
+                uint8_t pat = static_cast<uint8_t>(get_bits(4));
+                if (pat == 0b1111u) {
+                    // Pair of checkerboard halftone blocks
+                    for (int k = 0; k < 2 && bidx < 360; ++k, ++bidx) {
+                        size_t by = bidx / 24;
+                        size_t bx = bidx % 24;
+                        blk_pat[bidx] = (((bx + by) & 1u) != 0) ? 0b0110u : 0b1001u;
+                    }
+                } else {
+                    blk_pat[bidx++] = pat;
+                }
+            }
         }
 
         for (size_t by = 0; by < 15; ++by) {
             for (size_t bx = 0; bx < 24; ++bx) {
-                size_t bidx = by * 24 + bx;
-                uint8_t d = blk_density[bidx];
-                bool odd = ((bx + by) & 1u) != 0;
-                uint8_t pat = 0;
-                if (d == 0) {
-                    pat = 0b0000;
-                } else if (d == 4) {
-                    pat = 0b1111;
-                } else if (d == 2) {
-                    if (pos + 2 <= MONO_IMG_WIRE_BITS) {
-                        uint32_t c = get_bits(2);
-                        if (c == 0)      pat = odd ? 0b0110 : 0b1001;
-                        else if (c == 1) pat = 0b1100;
-                        else if (c == 2) pat = 0b0011;
-                        else             pat = odd ? 0b0101 : 0b1010;
-                    } else {
-                        pat = odd ? 0b0110 : 0b1001;
-                    }
-                } else if (d == 1) {
-                    uint32_t p = (pos + 2 <= MONO_IMG_WIRE_BITS) ? get_bits(2) : (odd ? 3u : 0u);
-                    pat = static_cast<uint8_t>(1u << (3u - p));
-                } else {
-                    uint32_t z = (pos + 2 <= MONO_IMG_WIRE_BITS) ? get_bits(2) : (odd ? 2u : 1u);
-                    pat = static_cast<uint8_t>(0b1111u ^ (1u << (3u - z)));
-                }
+                uint8_t pat = blk_pat[by * 24 + bx];
                 px[(by * 2) * MONO_IMG_W + (bx * 2)]         = (pat >> 3) & 1u;
                 px[(by * 2) * MONO_IMG_W + (bx * 2 + 1)]     = (pat >> 2) & 1u;
                 px[(by * 2 + 1) * MONO_IMG_W + (bx * 2)]     = (pat >> 1) & 1u;
