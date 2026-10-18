@@ -1,6 +1,7 @@
 #pragma once
 
 #include "crypto.hpp"
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -844,7 +845,18 @@ inline std::optional<DecodedRadioPacket> parse_companion_payload(const std::vect
 // Stateful streaming frame parser for 0x3E ('>') + u16 LE length + payload
 class FrameParser {
 public:
+    static bool is_valid_inbound_code(uint8_t c) noexcept {
+        return c <= 0x1D || c == PAYLOAD_TYPE_MONO_IMG || (c >= 0x80 && c <= 0x92);
+    }
+
     std::vector<std::vector<uint8_t>> feed(const uint8_t* data, size_t len) {
+        auto now = std::chrono::steady_clock::now();
+        if (!buffer_.empty() &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_feed_time_).count() > 250) {
+            // At 115200 baud, a valid frame completes in <25ms; any partial residue after 250ms of silence is stale
+            buffer_.clear();
+        }
+        last_feed_time_ = now;
         buffer_.insert(buffer_.end(), data, data + len);
         std::vector<std::vector<uint8_t>> frames;
 
@@ -861,7 +873,12 @@ public:
 
             uint16_t frame_len = static_cast<uint16_t>(buffer_[1]) |
                                  (static_cast<uint16_t>(buffer_[2]) << 8);
-            if (frame_len == 0 || frame_len > MAX_FRAME_PAYLOAD) {
+            // Companion frames are 1..300 bytes (buffer_[2] <= 0x01)
+            if (frame_len == 0 || frame_len > 300) {
+                buffer_.erase(buffer_.begin());
+                continue;
+            }
+            if (buffer_.size() >= 4 && !is_valid_inbound_code(buffer_[3])) {
                 buffer_.erase(buffer_.begin());
                 continue;
             }
@@ -876,6 +893,7 @@ public:
 
 private:
     std::vector<uint8_t> buffer_;
+    std::chrono::steady_clock::time_point last_feed_time_{std::chrono::steady_clock::now()};
 };
 
 // 8-Slot Hardware Channel LRU Manager
@@ -910,6 +928,12 @@ public:
         }
     }
 
+    void mark_non_public_unsynced() {
+        for (size_t i = 1; i < NUM_HW_CHANNEL_SLOTS; ++i) {
+            slots[i].synced = false;
+        }
+    }
+
     std::optional<uint8_t> slot_for_channel(const std::string& raw_name) const {
         std::string trimmed = trim_str(raw_name);
         std::string norm = normalize_channel_name(raw_name);
@@ -929,15 +953,18 @@ public:
         return (idx == 0) ? PUBLIC_CHANNEL_NAME : ("#slot" + std::to_string(idx));
     }
 
-    // Allocates or updates LRU slot 1..7 (or returns 0 for Public)
+    // Allocates or updates LRU slot 1..7 (or returns 0 for Public).
+    // Sets *out_needs_sync = true only when the hardware slot must be programmed via CMD_SET_CHANNEL.
     uint8_t allocate_or_touch(const std::string& raw_name,
                               std::array<uint8_t, 16>& out_psk,
-                              std::string& out_evicted) {
+                              std::string& out_evicted,
+                              bool* out_needs_sync = nullptr) {
         ++tick_counter;
         out_evicted.clear();
         std::string norm = normalize_channel_name(raw_name);
         if (norm == PUBLIC_CHANNEL_NAME) {
             out_psk = slots[0].psk;
+            if (out_needs_sync) *out_needs_sync = false;
             return 0;
         }
         std::string exact = trim_str(raw_name);
@@ -949,8 +976,11 @@ public:
         for (size_t i = 1; i < NUM_HW_CHANNEL_SLOTS; ++i) {
             if (!slots[i].channel_name.empty() &&
                 (slots[i].channel_name == exact || normalize_channel_name(slots[i].channel_name) == norm)) {
+                bool already_synced = slots[i].synced && (slots[i].psk == out_psk);
                 out_psk = slots[i].psk;
                 slots[i].last_used_tick = tick_counter;
+                slots[i].synced = true;
+                if (out_needs_sync) *out_needs_sync = !already_synced;
                 return static_cast<uint8_t>(i);
             }
         }
@@ -971,6 +1001,7 @@ public:
         slots[best_idx].channel_hash = hash;
         slots[best_idx].last_used_tick = tick_counter;
         slots[best_idx].synced = true;
+        if (out_needs_sync) *out_needs_sync = true;
         return static_cast<uint8_t>(best_idx);
     }
 

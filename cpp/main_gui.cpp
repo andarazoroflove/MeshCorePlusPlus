@@ -1749,6 +1749,7 @@ public:
     void handle_packet(const DecodedRadioPacket& pkt) {
         switch (pkt.kind) {
             case RadioPacketKind::DeviceInfo: {
+                hw_slots.mark_non_public_unsynced();
                 device_model = pkt.model.empty() ? "MeshCore Radio" : pkt.model;
                 firmware_ver = pkt.firmware;
                 build_date = pkt.build_date;
@@ -1826,7 +1827,7 @@ public:
                 record_node_snr_by_name(pkt.sender, pkt.rssi, pkt.snr, pkt.hops);
                 std::string ch = hw_slots.channel_for_slot(pkt.slot_idx);
                 ingest_decrypted_message(ch, pkt.sender, pkt.text, pkt.rssi, pkt.snr, pkt.hops, "", nullptr,
-                                         pkt.is_mono_img ? &pkt.mono_img_bytes : nullptr);
+                                         pkt.is_mono_img ? &pkt.mono_img_bytes : nullptr, pkt.timestamp);
                 break;
             }
             case RadioPacketKind::DirectMsgRecv: {
@@ -1939,7 +1940,8 @@ public:
                     route.time = now_hms_str();
                     ingest_decrypted_message(sniffed->channel_name, sniffed->sender, sniffed->text,
                                              pkt.rssi, pkt.snr, pkt.hops, path_desc, &route,
-                                             sniffed->is_mono_img ? &sniffed->mono_img_bytes : nullptr);
+                                             sniffed->is_mono_img ? &sniffed->mono_img_bytes : nullptr,
+                                             sniffed->timestamp);
                 } else if (!pkt.encrypted_frame.empty()) {
                     std::ostringstream oss;
                     oss << "[RF GROUP PKT] Encrypted channel frame (Bucket 0x"
@@ -2784,7 +2786,8 @@ public:
                                   uint8_t hops,
                                   const std::string& path_desc = "",
                                   const MessageRoute* route = nullptr,
-                                  const std::array<uint8_t, MONO_IMG_BYTES>* mono_img = nullptr) {
+                                  const std::array<uint8_t, MONO_IMG_BYTES>* mono_img = nullptr,
+                                  uint32_t pkt_ts = 0) {
         std::string ch = (normalize_channel_name(raw_ch) == PUBLIC_CHANNEL_NAME)
                              ? PUBLIC_CHANNEL_NAME
                              : raw_ch;
@@ -2795,11 +2798,15 @@ public:
             recent_dedup.pop_front();
         }
         std::string dedup_payload = mono_img ? hex_string(mono_img->data(), 24, "") : text;
-        std::string dedup_key = normalize_channel_name(ch) + "|" + sender + "|" + dedup_payload;
+        std::string dedup_key_base = normalize_channel_name(ch) + "|" + sender + "|" + dedup_payload;
+        bool is_self_echo = (!callsign.empty() && trim_str(sender) == trim_str(callsign));
+        std::string dedup_key = (!is_self_echo && pkt_ts != 0)
+                                    ? (dedup_key_base + "|" + std::to_string(pkt_ts))
+                                    : dedup_key_base;
         for (const auto& item : recent_dedup) {
-            if (item.key == dedup_key) {
+            if (item.key == dedup_key || (is_self_echo && item.key == dedup_key_base)) {
                 // Already displayed: attach this copy's repeater path to the message's trace
-                if (route) merge_route_into_messages(dedup_key, *route);
+                if (route) merge_route_into_messages(item.key, *route);
                 if (!path_desc.empty()) {
                     log_console("[FLOOD RELAY] Duplicate copy of <" + sender + "> in " + ch + " (" + path_desc + ")");
                 }
@@ -3065,8 +3072,15 @@ public:
 
         std::array<uint8_t, 16> psk{};
         std::string evicted;
-        uint8_t slot_idx = hw_slots.allocate_or_touch(name, psk, evicted);
-        transport.sync_channel_slot(slot_idx, name, psk);
+        bool needs_sync = false;
+        uint8_t slot_idx = hw_slots.allocate_or_touch(name, psk, evicted, &needs_sync);
+        if (silent_startup) {
+            if (slot_idx < NUM_HW_CHANNEL_SLOTS && slot_idx > 0) {
+                hw_slots.slots[slot_idx].synced = false;
+            }
+        } else if (needs_sync) {
+            transport.sync_channel_slot(slot_idx, name, psk);
+        }
 
         for (size_t i = 0; i < tabs.size(); ++i) {
             if (_stricmp(tabs[i].name.c_str(), name.c_str()) == 0 ||
@@ -3246,9 +3260,10 @@ public:
         std::string ch = tabs[active_tab_idx].name;
         std::array<uint8_t, 16> psk{};
         std::string evicted;
-        uint8_t slot_idx = hw_slots.allocate_or_touch(ch, psk, evicted);
+        bool needs_sync = false;
+        uint8_t slot_idx = hw_slots.allocate_or_touch(ch, psk, evicted, &needs_sync);
 
-        if (ch != PUBLIC_CHANNEL_NAME) {
+        if (ch != PUBLIC_CHANNEL_NAME && needs_sync) {
             transport.sync_channel_slot(slot_idx, ch, psk);
         }
         transport.send_channel_mono_image(slot_idx, ch, callsign, wire_bits);
@@ -3320,14 +3335,15 @@ public:
 
         std::array<uint8_t, 16> psk{};
         std::string evicted;
-        uint8_t slot_idx = hw_slots.allocate_or_touch(ch, psk, evicted);
+        bool needs_sync = false;
+        uint8_t slot_idx = hw_slots.allocate_or_touch(ch, psk, evicted, &needs_sync);
 
         for (const auto& tag : extract_hashtags(line)) {
             rainbow.add_channel(tag);
             register_or_update_discovered(tag, false, 0, 0.0f, true);
         }
 
-        if (ch != PUBLIC_CHANNEL_NAME) {
+        if (ch != PUBLIC_CHANNEL_NAME && needs_sync) {
             transport.sync_channel_slot(slot_idx, ch, psk);
         }
         transport.send_channel_message(slot_idx, ch, callsign, line);

@@ -204,6 +204,11 @@ struct MacBleState {
     id rx_char = nullptr;
     id tx_char = nullptr;
     long rx_write_type = 0; // 0 = CBCharacteristicWriteWithResponse, 1 = CBCharacteristicWriteWithoutResponse
+    bool write_in_flight = false;
+    uint64_t rx_seq = 0;
+    uint64_t ok_seq = 0;
+    uint64_t err_seq = 0;
+    uint8_t last_rx_code = 0xFF;
     bool connecting = false;
     bool connected = false;
     bool gatt_ready = false;
@@ -268,10 +273,13 @@ inline void mac_ble_start_connect_locked(id central, id delegate, id periph, con
     g_mac_ble.connecting = true;
     g_mac_ble.connected = false;
     g_mac_ble.gatt_ready = false;
+    g_mac_ble.write_in_flight = false;
     g_mac_ble.disconnected_event = false;
-    if (g_mac_ble.active_peripheral) CFRelease(g_mac_ble.active_peripheral);
-    CFRetain(periph);
-    g_mac_ble.active_peripheral = periph;
+    if (g_mac_ble.active_peripheral != periph) {
+        if (g_mac_ble.active_peripheral) CFRelease(g_mac_ble.active_peripheral);
+        CFRetain(periph);
+        g_mac_ble.active_peripheral = periph;
+    }
     g_mac_ble.connected_name = name.empty() ? ("BLE-" + uuid.substr(0, 8)) : name;
     g_mac_ble.logs.push_back("[BLE] Connecting to " + g_mac_ble.connected_name + " [" + uuid + "]...");
     g_mac_ble.status_label = "BLE: Connecting to " + g_mac_ble.connected_name + "...";
@@ -424,6 +432,7 @@ inline void mac_ble_did_connect(id self, SEL, id, id peripheral) {
     std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
     g_mac_ble.connecting = false;
     g_mac_ble.connected = true;
+    g_mac_ble.write_in_flight = false;
     g_mac_ble.logs.push_back("[BLE] Connected to " + g_mac_ble.connected_name + ". Discovering Nordic UART Service (6E400001-B5A3-F393-E0A9-E50E24DCCA9E)...");
     g_mac_ble.status_label = "BLE: " + g_mac_ble.connected_name + " (Discovering GATT...)";
     g_mac_ble.status_connected = true;
@@ -439,6 +448,7 @@ inline void mac_ble_did_fail_connect(id, SEL, id, id, id error) {
     g_mac_ble.connecting = false;
     g_mac_ble.connected = false;
     g_mac_ble.gatt_ready = false;
+    g_mac_ble.write_in_flight = false;
     g_mac_ble.disconnected_event = true;
     g_mac_ble.logs.push_back("[BLE] Failed to connect to " + g_mac_ble.connected_name + ": " + err_str);
     g_mac_ble.status_label = "BLE: Connection Failed (" + g_mac_ble.connected_name + ")";
@@ -446,19 +456,28 @@ inline void mac_ble_did_fail_connect(id, SEL, id, id, id error) {
     g_mac_ble.status_dirty = true;
 }
 
-inline void mac_ble_did_disconnect(id, SEL, id, id, id error) {
+inline void mac_ble_did_disconnect(id self, SEL, id central, id peripheral, id error) {
     std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
     std::string err_str = error ? mac_ns_to_std_str(mac_msg_send<id>(error, sel_registerName("localizedDescription"))) : "link closed";
     g_mac_ble.connecting = false;
     g_mac_ble.connected = false;
     g_mac_ble.gatt_ready = false;
+    g_mac_ble.write_in_flight = false;
     g_mac_ble.disconnected_event = true;
     if (g_mac_ble.rx_char) { CFRelease(g_mac_ble.rx_char); g_mac_ble.rx_char = nullptr; }
     if (g_mac_ble.tx_char) { CFRelease(g_mac_ble.tx_char); g_mac_ble.tx_char = nullptr; }
-    g_mac_ble.logs.push_back("[BLE] Disconnected from " + g_mac_ble.connected_name + " (" + err_str + ").");
-    g_mac_ble.status_label = "BLE: Disconnected";
+    g_mac_ble.logs.push_back("[BLE] Disconnected from " + g_mac_ble.connected_name + " (" + err_str + "). Auto-reconnecting...");
+    g_mac_ble.status_label = "BLE: Reconnecting to " + g_mac_ble.connected_name + "...";
     g_mac_ble.status_connected = false;
     g_mac_ble.status_dirty = true;
+
+    // Immediately queue non-expiring CoreBluetooth link reconnect + air scan so an idle T1000-E reconnects seamlessly
+    id target_p = peripheral ? peripheral : g_mac_ble.active_peripheral;
+    if (central && target_p) {
+        g_mac_ble.connecting = true;
+        mac_msg_send<void>(target_p, sel_registerName("setDelegate:"), self);
+        mac_msg_send<void>(central, sel_registerName("connectPeripheral:options:"), target_p, static_cast<id>(nullptr));
+    }
 }
 
 inline void mac_ble_did_discover_services(id, SEL, id peripheral, id error) {
@@ -546,6 +565,15 @@ inline void mac_ble_did_update_notify(id, SEL, id, id characteristic, id error) 
     }
 }
 
+inline void mac_ble_did_write_value(id, SEL, id, id, id error) {
+    std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+    g_mac_ble.write_in_flight = false;
+    if (error) {
+        std::string err_str = mac_ns_to_std_str(mac_msg_send<id>(error, sel_registerName("localizedDescription")));
+        g_mac_ble.logs.push_back("[BLE] GATT RX write error: " + err_str);
+    }
+}
+
 inline void mac_ble_did_update_value(id, SEL, id, id characteristic, id error) {
     if (error || !characteristic) return;
     id ns_data = mac_msg_send<id>(characteristic, sel_registerName("value"));
@@ -556,6 +584,12 @@ inline void mac_ble_did_update_value(id, SEL, id, id characteristic, id error) {
 
     std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
     g_mac_ble.rx_frames.emplace_back(ptr, ptr + len);
+    ++g_mac_ble.rx_seq;
+    uint8_t code0 = ptr[0];
+    if (len >= 4 && code0 == FRAME_INBOUND_MAGIC) code0 = ptr[3];
+    g_mac_ble.last_rx_code = code0;
+    if (code0 == RESP_CODE_OK) ++g_mac_ble.ok_seq;
+    else if (code0 == RESP_CODE_ERR) ++g_mac_ble.err_seq;
 }
 
 inline Class mac_get_ble_delegate_class() {
@@ -581,6 +615,8 @@ inline Class mac_get_ble_delegate_class() {
                             reinterpret_cast<IMP>(mac_ble_did_discover_chars), "v@:@@@");
             class_addMethod(cls, sel_registerName("peripheral:didUpdateNotificationStateForCharacteristic:error:"),
                             reinterpret_cast<IMP>(mac_ble_did_update_notify), "v@:@@@");
+            class_addMethod(cls, sel_registerName("peripheral:didWriteValueForCharacteristic:error:"),
+                            reinterpret_cast<IMP>(mac_ble_did_write_value), "v@:@@@");
             class_addMethod(cls, sel_registerName("peripheral:didUpdateValueForCharacteristic:error:"),
                             reinterpret_cast<IMP>(mac_ble_did_update_value), "v@:@@@");
             objc_registerClassPair(cls);
@@ -692,6 +728,22 @@ public:
         enqueue_cmd(cmd);
     }
 
+    void send_channel_mono_image(uint8_t slot_idx,
+                                 const std::string& channel_name,
+                                 const std::string& sender,
+                                 const std::array<uint8_t, MONO_IMG_BYTES>& bits) {
+        uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+        OutboundCmd cmd;
+        cmd.kind = OutboundCmd::Kind::SendMonoImg;
+        cmd.slot_idx = slot_idx;
+        cmd.txt_type = PAYLOAD_TYPE_MONO_IMG;
+        cmd.channel_name = channel_name;
+        cmd.sender = sender;
+        cmd.mono_bits = bits;
+        cmd.raw_payload = build_cmd_send_channel_mono_img(slot_idx, now, bits);
+        enqueue_cmd(cmd);
+    }
+
     void send_direct_message(const std::array<uint8_t, 6>& pubkey_prefix,
                              const std::string& recipient_name,
                              const std::string& text,
@@ -795,13 +847,14 @@ public:
 
 private:
     struct OutboundCmd {
-        enum class Kind { Raw, SyncSlot, SendMsg, SendDirectMsg, SendTrace, SendLogin, SendStatus, SendAdvert } kind = Kind::Raw;
+        enum class Kind { Raw, SyncSlot, SendMsg, SendMonoImg, SendDirectMsg, SendTrace, SendLogin, SendStatus, SendAdvert } kind = Kind::Raw;
         uint8_t slot_idx = 0;
         uint8_t txt_type = 0;
         uint32_t tag = 0;
         std::string channel_name;
         std::string sender;
         std::string text;
+        std::array<uint8_t, MONO_IMG_BYTES> mono_bits{};
         std::array<uint8_t, 6> pubkey_prefix{};
         std::vector<uint8_t> path_hashes;
         std::array<uint8_t, 16> psk{};
@@ -830,6 +883,16 @@ private:
     void enqueue_cmd(const OutboundCmd& cmd) {
         std::lock_guard<std::mutex> lock(cmds_mutex_);
         cmds_.push_back(cmd);
+    }
+
+    void requeue_cmd_front(const OutboundCmd& cmd) {
+        std::lock_guard<std::mutex> lock(cmds_mutex_);
+        cmds_.push_front(cmd);
+    }
+
+    bool has_pending_cmd() {
+        std::lock_guard<std::mutex> lock(cmds_mutex_);
+        return !cmds_.empty();
     }
 
     bool pop_cmd(OutboundCmd& out) {
@@ -942,6 +1005,8 @@ private:
             uint8_t read_buf[1024];
 
             bool connection_alive = true;
+            bool last_rx_got_ok = false;
+            bool last_rx_got_err = false;
 
             auto drain_serial_rx = [&](int wait_ms) -> bool {
                 bool got_any_frame = false;
@@ -965,6 +1030,10 @@ private:
                         raw_ascii.append(reinterpret_cast<const char*>(read_buf), bytes_read);
                         for (const auto& payload : parser.feed(read_buf, bytes_read)) {
                             got_any_frame = true;
+                            if (!payload.empty()) {
+                                if (payload[0] == RESP_CODE_OK) last_rx_got_ok = true;
+                                else if (payload[0] == RESP_CODE_ERR) last_rx_got_err = true;
+                            }
                             if (auto pkt = parse_companion_payload(payload)) {
                                 MeshEvent ev;
                                 ev.type = EventType::RadioPacket;
@@ -1039,14 +1108,39 @@ private:
                 OutboundCmd cmd;
                 while (pop_cmd(cmd)) {
                     if (!cmd.raw_payload.empty()) {
+                        last_bat_poll = std::chrono::steady_clock::now();
+                        last_rx_got_ok = false;
+                        last_rx_got_err = false;
                         write_framed(cmd.raw_payload);
+                        drain_serial_rx(cmd.kind == OutboundCmd::Kind::SyncSlot ? 220 : 180);
+
+                        if ((cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) &&
+                            !last_rx_got_ok && !last_rx_got_err) {
+                            drain_serial_rx(220);
+                        }
+                        if ((cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) &&
+                            (!last_rx_got_ok || last_rx_got_err)) {
+                            if (cmd.slot_idx > 0 && !cmd.channel_name.empty()) {
+                                write_framed(build_cmd_set_channel(cmd.slot_idx, cmd.channel_name, derive_psk(cmd.channel_name)));
+                                drain_serial_rx(220);
+                            }
+                            uint32_t retry_ts = static_cast<uint32_t>(std::time(nullptr)) + 1u;
+                            std::vector<uint8_t> retry_payload =
+                                (cmd.kind == OutboundCmd::Kind::SendMonoImg)
+                                    ? build_cmd_send_channel_mono_img(cmd.slot_idx, retry_ts, cmd.mono_bits)
+                                    : build_cmd_send_channel_txt_msg(cmd.slot_idx, retry_ts, cmd.text);
+                            write_framed(retry_payload);
+                            drain_serial_rx(220);
+                        }
                     }
                 }
 
                 auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 30) {
+                if (!has_pending_cmd() &&
+                    std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 30) {
                     last_bat_poll = now;
                     write_framed(build_cmd_get_bat());
+                    drain_serial_rx(80);
                     write_framed(build_cmd_sync_next_message());
                 }
             }
@@ -1098,6 +1192,8 @@ private:
             FrameParser parser;
             uint8_t read_buf[1024];
             bool connection_alive = true;
+            bool last_rx_got_ok = false;
+            bool last_rx_got_err = false;
 
             auto drain_serial_rx = [&](int wait_ms) -> bool {
                 bool got_any_frame = false;
@@ -1107,6 +1203,10 @@ private:
                     if (n > 0) {
                         for (const auto& payload : parser.feed(read_buf, static_cast<size_t>(n))) {
                             got_any_frame = true;
+                            if (!payload.empty()) {
+                                if (payload[0] == RESP_CODE_OK) last_rx_got_ok = true;
+                                else if (payload[0] == RESP_CODE_ERR) last_rx_got_err = true;
+                            }
                             if (auto pkt = parse_companion_payload(payload)) {
                                 MeshEvent ev;
                                 ev.type = EventType::RadioPacket;
@@ -1156,12 +1256,39 @@ private:
                 drain_serial_rx(30);
                 OutboundCmd cmd;
                 while (pop_cmd(cmd)) {
-                    if (!cmd.raw_payload.empty()) write_framed(cmd.raw_payload);
+                    if (!cmd.raw_payload.empty()) {
+                        last_bat_poll = std::chrono::steady_clock::now();
+                        last_rx_got_ok = false;
+                        last_rx_got_err = false;
+                        write_framed(cmd.raw_payload);
+                        drain_serial_rx(cmd.kind == OutboundCmd::Kind::SyncSlot ? 220 : 180);
+
+                        if ((cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) &&
+                            !last_rx_got_ok && !last_rx_got_err) {
+                            drain_serial_rx(220);
+                        }
+                        if ((cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) &&
+                            (!last_rx_got_ok || last_rx_got_err)) {
+                            if (cmd.slot_idx > 0 && !cmd.channel_name.empty()) {
+                                write_framed(build_cmd_set_channel(cmd.slot_idx, cmd.channel_name, derive_psk(cmd.channel_name)));
+                                drain_serial_rx(220);
+                            }
+                            uint32_t retry_ts = static_cast<uint32_t>(std::time(nullptr)) + 1u;
+                            std::vector<uint8_t> retry_payload =
+                                (cmd.kind == OutboundCmd::Kind::SendMonoImg)
+                                    ? build_cmd_send_channel_mono_img(cmd.slot_idx, retry_ts, cmd.mono_bits)
+                                    : build_cmd_send_channel_txt_msg(cmd.slot_idx, retry_ts, cmd.text);
+                            write_framed(retry_payload);
+                            drain_serial_rx(220);
+                        }
+                    }
                 }
                 auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 30) {
+                if (!has_pending_cmd() &&
+                    std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 30) {
                     last_bat_poll = now;
                     write_framed(build_cmd_get_bat());
+                    drain_serial_rx(80);
                     write_framed(build_cmd_sync_next_message());
                 }
             }
@@ -1256,6 +1383,7 @@ private:
             g_mac_ble.connecting = false;
             g_mac_ble.connected = false;
             g_mac_ble.gatt_ready = false;
+            g_mac_ble.write_in_flight = false;
             g_mac_ble.disconnected_event = false;
             if (g_mac_ble.rx_char) { CFRelease(g_mac_ble.rx_char); g_mac_ble.rx_char = nullptr; }
             if (g_mac_ble.tx_char) { CFRelease(g_mac_ble.tx_char); g_mac_ble.tx_char = nullptr; }
@@ -1327,18 +1455,61 @@ private:
             }
         }
 
-        auto write_ble_raw = [&](const std::vector<uint8_t>& payload) {
-            if (payload.empty()) return;
+        // Synchronized BLE NUS GATT write helper:
+        // 1. Waits for any previous in-flight ATT Write Request to complete (BLE Core Spec Vol 3, Part F, 3.3.2).
+        // 2. Verifies CBPeripheralStateConnected (2); if link dropped while idle, triggers immediate reconnect.
+        // 3. Waits for peripheral:didWriteValueForCharacteristic:error: AND radio response notification (rx_seq)
+        //    so two commands never coalesce or overflow (>172B) in nRF52 SerialBLEInterface's bleuart FIFO.
+        auto write_ble_raw = [&](const std::vector<uint8_t>& payload, int max_rx_wait_ms = 240) -> bool {
+            if (payload.empty()) return false;
+
+            // 1. Wait for any previous ATT WriteWithResponse to finish
+            auto wait_start = std::chrono::steady_clock::now();
+            while (running_) {
+                bool busy = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                    busy = g_mac_ble.write_in_flight;
+                }
+                if (!busy) break;
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - wait_start).count() >= 400) {
+                    std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                    g_mac_ble.write_in_flight = false;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+
             id periph = nullptr;
             id rx_ch = nullptr;
             long wtype = 0;
+            uint64_t prev_rx_seq = 0;
             {
                 std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
-                if (!g_mac_ble.connected || !g_mac_ble.active_peripheral || !g_mac_ble.rx_char) return;
+                if (!g_mac_ble.connected || !g_mac_ble.active_peripheral || !g_mac_ble.rx_char) return false;
+                long pstate = mac_msg_send<long>(g_mac_ble.active_peripheral, sel_registerName("state"));
+                if (pstate != 2) { // CBPeripheralStateConnected == 2
+                    g_mac_ble.connected = false;
+                    g_mac_ble.gatt_ready = false;
+                    g_mac_ble.write_in_flight = false;
+                    g_mac_ble.disconnected_event = true;
+                    if (g_mac_ble.central && g_mac_ble.active_peripheral) {
+                        g_mac_ble.connecting = true;
+                        mac_msg_send<void>(g_mac_ble.active_peripheral, sel_registerName("setDelegate:"), g_mac_ble.delegate);
+                        mac_msg_send<void>(g_mac_ble.central, sel_registerName("connectPeripheral:options:"),
+                                           g_mac_ble.active_peripheral, static_cast<id>(nullptr));
+                    }
+                    return false;
+                }
                 periph = g_mac_ble.active_peripheral;
                 rx_ch = g_mac_ble.rx_char;
                 wtype = g_mac_ble.rx_write_type;
+                prev_rx_seq = g_mac_ble.rx_seq;
+                g_mac_ble.write_in_flight = (wtype == 0);
             }
+
+            id pool = mac_cls_send<id>("NSAutoreleasePool", sel_registerName("new"));
             // Official MeshCore SerialBLEInterface (SenseCAP T1000-E nRF52 & Heltec V3 ESP32) expects RAW unframed command bytes per GATT write
             id ns_data = mac_cls_send<id>("NSData", sel_registerName("dataWithBytes:length:"),
                                           payload.data(), static_cast<unsigned long>(payload.size()));
@@ -1349,9 +1520,35 @@ private:
                 tx_ev.type = EventType::RawTx;
                 tx_ev.tx_payload = payload;
                 push_event(tx_ev);
+            } else {
+                std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                g_mac_ble.write_in_flight = false;
             }
-            // Space consecutive BLE GATT writes by 65ms (MeshCore BLE_WRITE_MIN_INTERVAL = 60ms)
-            std::this_thread::sleep_for(std::chrono::milliseconds(65));
+            if (pool) mac_msg_send<void>(pool, sel_registerName("drain"));
+
+            // Wait for GATT write callback + radio command response so bleuart FIFO is completely drained before next write
+            auto ack_start = std::chrono::steady_clock::now();
+            while (running_) {
+                bool write_done = false;
+                bool rx_advanced = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                    write_done = !g_mac_ble.write_in_flight;
+                    rx_advanced = (g_mac_ble.rx_seq != prev_rx_seq);
+                }
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - ack_start).count();
+                if (write_done && (rx_advanced || elapsed >= max_rx_wait_ms)) break;
+                if (elapsed >= 450) {
+                    std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                    g_mac_ble.write_in_flight = false;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(12));
+            }
+            // Post-command guard time (MeshCore BLE_WRITE_MIN_INTERVAL = 60ms)
+            std::this_thread::sleep_for(std::chrono::milliseconds(55));
+            return true;
         };
 
         bool handshake_sent = false;
@@ -1362,14 +1559,14 @@ private:
 
         auto send_full_ble_handshake = [&]() {
             push_log("[BLE] Handshaking with SenseCAP T1000-E / MeshCore BLE Companion...");
-            write_ble_raw(build_cmd_device_query());
-            write_ble_raw(build_cmd_app_start("MeshCore++"));
-            write_ble_raw(build_cmd_get_bat());
+            write_ble_raw(build_cmd_device_query(), 260);
+            write_ble_raw(build_cmd_app_start("MeshCore++"), 260);
+            write_ble_raw(build_cmd_get_bat(), 200);
             for (uint8_t slot = 0; slot < NUM_HW_CHANNEL_SLOTS && running_; ++slot) {
-                write_ble_raw(build_cmd_get_channel(slot));
+                write_ble_raw(build_cmd_get_channel(slot), 180);
             }
-            write_ble_raw(build_cmd_get_contacts());
-            write_ble_raw(build_cmd_sync_next_message());
+            write_ble_raw(build_cmd_get_contacts(), 350);
+            write_ble_raw(build_cmd_sync_next_message(), 200);
             last_handshake_t = std::chrono::steady_clock::now();
         };
 
@@ -1390,6 +1587,19 @@ private:
                             g_mac_ble.central = mac_msg_send<id>(cm_alloc,
                                                                  sel_registerName("initWithDelegate:queue:"),
                                                                  g_mac_ble.delegate, static_cast<id>(nullptr));
+                        } else if (st == 5 && g_mac_ble.connected && g_mac_ble.active_peripheral) {
+                            // Verify peripheral hasn't silently dropped out of CBPeripheralStateConnected (2) while idle
+                            long pst = mac_msg_send<long>(g_mac_ble.active_peripheral, sel_registerName("state"));
+                            if (pst != 2) {
+                                g_mac_ble.connected = false;
+                                g_mac_ble.gatt_ready = false;
+                                g_mac_ble.write_in_flight = false;
+                                g_mac_ble.disconnected_event = true;
+                                g_mac_ble.connecting = true;
+                                mac_msg_send<void>(g_mac_ble.active_peripheral, sel_registerName("setDelegate:"), g_mac_ble.delegate);
+                                mac_msg_send<void>(g_mac_ble.central, sel_registerName("connectPeripheral:options:"),
+                                                   g_mac_ble.active_peripheral, static_cast<id>(nullptr));
+                            }
                         }
                     }
                 }
@@ -1439,9 +1649,15 @@ private:
                 handshake_sent = false;
                 got_any_rx = false;
                 handshake_retries = 0;
-                // Automatically resume scanning after a disconnect if still running
+                // Automatically resume both direct connectPeripheral and NUS scan after an idle disconnect
                 std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
                 if (g_mac_ble.central && running_) {
+                    if (g_mac_ble.active_peripheral) {
+                        g_mac_ble.connecting = true;
+                        mac_msg_send<void>(g_mac_ble.active_peripheral, sel_registerName("setDelegate:"), g_mac_ble.delegate);
+                        mac_msg_send<void>(g_mac_ble.central, sel_registerName("connectPeripheral:options:"),
+                                           g_mac_ble.active_peripheral, static_cast<id>(nullptr));
+                    }
                     mac_msg_send<void>(g_mac_ble.central, sel_registerName("scanForPeripheralsWithServices:options:"),
                                        static_cast<id>(nullptr), static_cast<id>(nullptr));
                 }
@@ -1467,7 +1683,9 @@ private:
                         pkt->kind == RadioPacketKind::DirectMsgRecv ||
                         pkt->kind == RadioPacketKind::ContactsEnd ||
                         pkt->kind == RadioPacketKind::RawSniffedGroupFrame) {
-                        write_ble_raw(build_cmd_sync_next_message());
+                        if (!has_pending_cmd()) {
+                            write_ble_raw(build_cmd_sync_next_message(), 180);
+                        }
                     }
                 }
             }
@@ -1487,13 +1705,74 @@ private:
 
                 OutboundCmd cmd;
                 while (pop_cmd(cmd)) {
-                    if (!cmd.raw_payload.empty()) write_ble_raw(cmd.raw_payload);
+                    if (cmd.raw_payload.empty()) continue;
+                    last_bat_poll = std::chrono::steady_clock::now();
+
+                    uint64_t ok_before = 0;
+                    uint64_t err_before = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                        ok_before = g_mac_ble.ok_seq;
+                        err_before = g_mac_ble.err_seq;
+                    }
+
+                    int wait_ms = (cmd.kind == OutboundCmd::Kind::SyncSlot ||
+                                   cmd.kind == OutboundCmd::Kind::SendMonoImg ||
+                                   cmd.kind == OutboundCmd::Kind::SendMsg) ? 320 : 220;
+                    if (!write_ble_raw(cmd.raw_payload, wait_ms)) {
+                        // Link disconnected mid-write: preserve user message/image at front of queue for auto-reconnect
+                        if (cmd.kind == OutboundCmd::Kind::SendMonoImg ||
+                            cmd.kind == OutboundCmd::Kind::SendMsg ||
+                            cmd.kind == OutboundCmd::Kind::SendDirectMsg) {
+                            requeue_cmd_front(cmd);
+                        }
+                        break;
+                    }
+
+                    // For channel messages & 0x49 images: verify the radio acknowledged with RESP_CODE_OK (0x00).
+                    // If the BLE link was waking from idle latency or the slot needed re-syncing, automatically
+                    // program the slot and re-transmit so the packet is never lost after sitting idle.
+                    if (cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) {
+                        bool got_ok = false;
+                        bool got_err = false;
+                        auto verify_start = std::chrono::steady_clock::now();
+                        while (running_) {
+                            {
+                                std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                                got_ok = (g_mac_ble.ok_seq > ok_before);
+                                got_err = (g_mac_ble.err_seq > err_before);
+                            }
+                            if (got_ok || got_err) break;
+                            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - verify_start).count() >= 220) {
+                                break;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                        }
+                        if (!got_ok || got_err) {
+                            push_log("[BLE] Waking idle BLE link / syncing Slot " + std::to_string(cmd.slot_idx) +
+                                     " (" + cmd.channel_name + ") and confirming RF transmission...");
+                            if (cmd.slot_idx > 0 && !cmd.channel_name.empty()) {
+                                write_ble_raw(build_cmd_set_channel(cmd.slot_idx, cmd.channel_name, derive_psk(cmd.channel_name)), 320);
+                            }
+                            uint32_t retry_ts = static_cast<uint32_t>(std::time(nullptr)) + 1u;
+                            std::vector<uint8_t> retry_payload =
+                                (cmd.kind == OutboundCmd::Kind::SendMonoImg)
+                                    ? build_cmd_send_channel_mono_img(cmd.slot_idx, retry_ts, cmd.mono_bits)
+                                    : build_cmd_send_channel_txt_msg(cmd.slot_idx, retry_ts, cmd.text);
+                            write_ble_raw(retry_payload, 320);
+                        }
+                    }
                 }
 
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 30) {
+                now = std::chrono::steady_clock::now();
+                if (!has_pending_cmd() &&
+                    std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 30) {
                     last_bat_poll = now;
-                    write_ble_raw(build_cmd_get_bat());
-                    write_ble_raw(build_cmd_sync_next_message());
+                    write_ble_raw(build_cmd_get_bat(), 200);
+                    if (!has_pending_cmd()) {
+                        write_ble_raw(build_cmd_sync_next_message(), 200);
+                    }
                 }
             }
 
@@ -1648,6 +1927,12 @@ private:
                     std::string reply_txt = "QSL " + cmd.sender + "! Solid copy on " + cmd.channel_name +
                                             " (+8.5dB SNR via Summit Peak relay)";
                     SimTx reply{cmd.channel_name.c_str(), "W1AW", reply_txt.c_str(), -74, 34, 1};
+                    emit_sim_packet(reply, 0);
+                } else if (cmd.kind == OutboundCmd::Kind::SendMonoImg) {
+                    feed_wire_into_parser(wire_parser, {RESP_CODE_OK});
+                    std::string reply_txt = "QSL " + cmd.sender + "! 1-Bit Tactical Bitmap (48x30, 181B opcode 0x49) copied clean on " +
+                                            cmd.channel_name + " (+9.2dB SNR)";
+                    SimTx reply{cmd.channel_name.c_str(), "W1AW", reply_txt.c_str(), -72, 37, 1};
                     emit_sim_packet(reply, 0);
                 } else if (cmd.kind == OutboundCmd::Kind::SendDirectMsg) {
                     // 1. Emit RESP_SENT (0x06) + PUSH_SEND_CONFIRMED (0x82)
