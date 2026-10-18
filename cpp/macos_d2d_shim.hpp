@@ -131,6 +131,12 @@ void CTLineDraw(CTLineRef line, CGContextRef context);
 typedef struct CGImageSource* CGImageSourceRef;
 CGImageSourceRef CGImageSourceCreateWithData(CFDataRef data, CFDictionaryRef options);
 CGImageRef CGImageSourceCreateImageAtIndex(CGImageSourceRef isrc, size_t index, CFDictionaryRef options);
+
+#ifdef MESHCORE_IOS
+int UIApplicationMain(int argc, char* argv[], id principalClassName, id delegateClassName);
+CGContextRef UIGraphicsGetCurrentContext(void);
+id UIImagePNGRepresentation(id image);
+#endif
 } // extern "C"
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -157,7 +163,7 @@ CGImageRef CGImageSourceCreateImageAtIndex(CGImageSourceRef isrc, size_t index, 
 #endif
 
 // ============================================================================
-// Win32 / Direct2D / DirectWrite Compatibility Layer for macOS Sonoma+ (AppKit + Quartz 2D + CoreText)
+// Win32 / Direct2D / DirectWrite Compatibility Layer for macOS Sonoma+ & iOS
 // ============================================================================
 using UINT = unsigned int;
 using UINT32 = uint32_t;
@@ -204,9 +210,12 @@ struct MacWindowState {
     int height = 880;
     id ns_window = nullptr;
     id ns_view = nullptr;
+    id ios_vc = nullptr;
     CGContextRef active_cg = nullptr;
     bool needs_display = false;
 };
+
+inline void (*g_ios_on_image_picked)(const std::wstring&) = nullptr;
 
 using HWND = MacWindowState*;
 using HDC  = CGContextRef;

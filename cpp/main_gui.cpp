@@ -206,10 +206,22 @@ private:
     bool download_curl(uint64_t k, std::vector<uint8_t>& out) {
         int z = static_cast<int>((k >> 56) & 63);
         int x = static_cast<int>((k >> 28) & 0xFFFFFFF), y = static_cast<int>(k & 0xFFFFFFF);
+        char url_buf[256];
+        std::snprintf(url_buf, sizeof(url_buf), "https://tile.openstreetmap.org/%d/%d/%d.png", z, x, y);
+#ifdef MESHCORE_IOS
+        id url = mac_cls_send<id>("NSURL", sel_registerName("URLWithString:"), mac_ns_str(url_buf));
+        id data = url ? mac_cls_send<id>("NSData", sel_registerName("dataWithContentsOfURL:"), url) : nullptr;
+        if (!data) return false;
+        const uint8_t* ptr = mac_msg_send<const uint8_t*>(data, sel_registerName("bytes"));
+        unsigned long len = mac_msg_send<unsigned long>(data, sel_registerName("length"));
+        if (!ptr || len <= 64) return false;
+        out.assign(ptr, ptr + len);
+        return true;
+#else
         char cmd[512];
         std::snprintf(cmd, sizeof(cmd),
-                      "/usr/bin/curl -sfL -m 8 -A 'MeshCorePlusPlus/1.0 (macOS Sonoma)' 'https://tile.openstreetmap.org/%d/%d/%d.png'",
-                      z, x, y);
+                      "/usr/bin/curl -sfL -m 8 -A 'MeshCorePlusPlus/1.0 (macOS Sonoma)' '%s'",
+                      url_buf);
         FILE* fp = popen(cmd, "r");
         if (!fp) return false;
         uint8_t buf[4096];
@@ -219,6 +231,7 @@ private:
         }
         int rc = pclose(fp);
         return rc == 0 && out.size() > 64;
+#endif
     }
 #endif
 
@@ -585,6 +598,8 @@ static void reveal_in_explorer(const std::wstring& file) {
 #ifdef _WIN32
     std::wstring args = L"/select,\"" + file + L"\"";
     ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+#elif defined(MESHCORE_IOS)
+    (void)file;
 #elif defined(__APPLE__)
     std::string utf8 = mac_wide_to_utf8(file);
     std::string cmd = "/usr/bin/open -R \"" + utf8 + "\" >/dev/null 2>&1 &";
@@ -606,6 +621,12 @@ static void copy_text_to_clipboard(HWND hwnd, const std::string& text) {
         }
     }
     CloseClipboard();
+#elif defined(MESHCORE_IOS)
+    (void)hwnd;
+    id pb = mac_cls_send<id>("UIPasteboard", sel_registerName("generalPasteboard"));
+    if (pb) {
+        mac_msg_send<void>(pb, sel_registerName("setString:"), mac_ns_str(text.c_str()));
+    }
 #elif defined(__APPLE__)
     (void)hwnd;
     FILE* fp = popen("/usr/bin/pbcopy", "w");
@@ -630,6 +651,12 @@ static std::string get_clipboard_text(HWND hwnd) {
     }
     CloseClipboard();
     return out;
+#elif defined(MESHCORE_IOS)
+    (void)hwnd;
+    id pb = mac_cls_send<id>("UIPasteboard", sel_registerName("generalPasteboard"));
+    if (!pb) return "";
+    id s = mac_msg_send<id>(pb, sel_registerName("string"));
+    return mac_ns_to_std_str(s);
 #elif defined(__APPLE__)
     (void)hwnd;
     std::string out;
@@ -940,6 +967,7 @@ public:
     // Cols 0..1 are on the Left of the main chat window (up to 2 wide, up to 4 stacked each)
     // Cols 2..3 are on the Right of the main chat window (up to 2 wide, up to 4 stacked each)
     bool light_mode = false;
+    int mobile_tab = 0; // 0=Chat, 1=Nodes, 2=#Sniffer, 3=#Channels, 4=Radio
     std::array<ModuleColumn, 4> module_cols;
 
     int dragging_module = -1;       // -1 if not dragging a module, else 0..3
@@ -3122,6 +3150,7 @@ public:
             tabs[idx].unread_count = 0;
             tabs[idx].has_mention = false;
             tabs[idx].scroll_offset = 0;
+            mobile_tab = 0;
         }
     }
 
@@ -3657,7 +3686,12 @@ enum ButtonId {
     BTN_RESET_LAYOUT = 68,
     BTN_ATTACH_IMAGE = 69,
     BTN_CONFIRM_SEND_IMAGE = 70,
-    BTN_CANCEL_SEND_IMAGE = 71
+    BTN_CANCEL_SEND_IMAGE = 71,
+    BTN_MOB_TAB_CHAT = 72,
+    BTN_MOB_TAB_NODES = 73,
+    BTN_MOB_TAB_SNIFFER = 74,
+    BTN_MOB_TAB_CHANNELS = 75,
+    BTN_MOB_TAB_RADIO = 76
 };
 
 class D2DRenderer {
@@ -4080,14 +4114,129 @@ public:
         rt->BeginDraw();
         rt->Clear(hex_color(0x090D16));
 
+        ID2D1SolidColorBrush* line_brush = nullptr;
+        rt->CreateSolidColorBrush(hex_color(0x1E293B), &line_brush);
+
+#ifdef MESHCORE_IOS
+        constexpr bool force_mobile = true;
+        const float safe_top = 48.0f;
+        const float safe_bot = 22.0f;
+#else
+        constexpr bool force_mobile = false;
+        const float safe_top = 0.0f;
+        const float safe_bot = 0.0f;
+#endif
+        const bool is_mobile = force_mobile || (W < 700.0f);
+
+        if (is_mobile) {
+            float top_h = safe_top + 46.0f;
+            fill_round_rect(D2D1::RectF(0, 0, W, top_h), 0.0f, hex_color(0x0F172A));
+            if (line_brush) {
+                rt->DrawLine(D2D1::Point2F(0, top_h), D2D1::Point2F(W, top_h), line_brush, 1.5f);
+            }
+
+            float ty = safe_top + 7.0f;
+            float th = 32.0f;
+            draw_text("MESHCORE++", font_ui_bold, D2D1::RectF(10, ty, 118, ty + th), hex_color(0x00E5FF));
+
+            auto draw_mob_top_btn = [&](int id, float x, float w, const std::string& lbl, bool active, uint32_t acc) {
+                D2D1_RECT_F r = D2D1::RectF(x, ty, x + w, ty + th);
+                fill_round_rect(r, 6.0f, active ? hex_color(acc, 0.22f) : hex_color(0x131C2E));
+                draw_round_rect(r, 6.0f, active ? hex_color(acc) : hex_color(0x26354D), 1.2f);
+                draw_text(lbl, font_small, r, active ? hex_color(acc) : hex_color(0xE2E8F0), DWRITE_TEXT_ALIGNMENT_CENTER);
+                app.button_hits.push_back({r, id, ""});
+            };
+
+            bool ble_act = (!app.is_sim && app.transport_label.find("BLE") != std::string::npos) || app.ble_dropdown_open;
+            draw_mob_top_btn(BTN_BLE_NUS, 114, 72, ble_act ? "BLE: ON" : "BLE v", ble_act, 0x38BDF8);
+            draw_mob_top_btn(BTN_ADD_TAG, 190, 56, "+ #Tag", false, 0xA855F7);
+            draw_mob_top_btn(BTN_TOGGLE_THEME, 250, 52, app.light_mode ? "Dark" : "Light", app.light_mode, 0xFBBF24);
+
+            char bat_s[32];
+            std::snprintf(bat_s, sizeof(bat_s), "%u%%", app.battery_pct);
+            D2D1_RECT_F bat_r = D2D1::RectF(W - 58.0f, ty, W - 8.0f, ty + th);
+            fill_round_rect(bat_r, 6.0f, hex_color(0x111A2B));
+            draw_round_rect(bat_r, 6.0f, hex_color(0x10B981, 0.6f), 1.0f);
+            draw_text(bat_s, font_mono_small, bat_r, hex_color(0x34D399), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+            float nav_h = 46.0f;
+            float nav_y = H - safe_bot - nav_h;
+            fill_round_rect(D2D1::RectF(0, nav_y, W, H), 0.0f, hex_color(0x0F172A));
+            if (line_brush) {
+                rt->DrawLine(D2D1::Point2F(0, nav_y), D2D1::Point2F(W, nav_y), line_brush, 1.5f);
+            }
+
+            struct MobNavItem { int id; int tab; const char* label; uint32_t color; };
+            static const MobNavItem NAV_ITEMS[5] = {
+                {BTN_MOB_TAB_CHAT,     0, "Chat",     0x00E5FF},
+                {BTN_MOB_TAB_NODES,    1, "Nodes",    0x10B981},
+                {BTN_MOB_TAB_SNIFFER,  2, "#Sniffer", 0xA855F7},
+                {BTN_MOB_TAB_CHANNELS, 3, "Chans",    0x38BDF8},
+                {BTN_MOB_TAB_RADIO,    4, "Radio",    0xFBBF24}
+            };
+            float tab_w = (W - 16.0f) / 5.0f;
+            for (int i = 0; i < 5; ++i) {
+                float tx = 8.0f + i * tab_w;
+                D2D1_RECT_F tr = D2D1::RectF(tx + 2.0f, nav_y + 5.0f, tx + tab_w - 2.0f, nav_y + nav_h - 5.0f);
+                bool sel = (app.mobile_tab == NAV_ITEMS[i].tab);
+                fill_round_rect(tr, 7.0f, sel ? hex_color(NAV_ITEMS[i].color, 0.22f) : hex_color(0x131C2E));
+                draw_round_rect(tr, 7.0f, sel ? hex_color(NAV_ITEMS[i].color) : hex_color(0x26354D), sel ? 1.5f : 1.0f);
+                draw_text(NAV_ITEMS[i].label, font_ui_bold, tr,
+                          sel ? hex_color(NAV_ITEMS[i].color) : hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
+                app.button_hits.push_back({tr, NAV_ITEMS[i].id, ""});
+            }
+
+            float cy = top_h + 6.0f;
+            float ch = std::max(120.0f, nav_y - cy - 6.0f);
+            float cx = 6.0f;
+            float cw = W - 12.0f;
+
+            if (app.mobile_tab == 0) {
+                render_tool_strip(app, cx, cy, cw);
+                float vy = cy + 36.0f;
+                float vh = ch - 36.0f;
+                app.tool_view_rect = D2D1::RectF(cx, vy, cx + cw, vy + vh);
+                switch (app.center_view) {
+                    case CenterView::Packets: render_packets_view(app, cx, vy, cw, vh); break;
+                    case CenterView::Adverts: render_adverts_view(app, cx, vy, cw, vh); break;
+                    case CenterView::Paths:   render_paths_view(app, cx, vy, cw, vh); break;
+                    case CenterView::Map:     render_map_view(app, cx, vy, cw, vh); break;
+                    default:                  render_center_workstation(app, cx, vy, cw, vh); break;
+                }
+            } else if (app.mobile_tab == 1) {
+                render_single_module(app, MOD_PUBLIC_MESH, cx, cy, cw, ch);
+            } else if (app.mobile_tab == 2) {
+                render_single_module(app, MOD_RAINBOW_SNIFFER, cx, cy, cw, ch);
+            } else if (app.mobile_tab == 3) {
+                render_single_module(app, MOD_JOINED_CHANNELS, cx, cy, cw, ch);
+            } else if (app.mobile_tab == 4) {
+                render_single_module(app, MOD_HW_SLOTS, cx, cy, cw, ch);
+            }
+
+            if (app.ble_dropdown_open) {
+                render_ble_dropdown(app, 12.0f, top_h + 4.0f);
+            }
+
+            if (line_brush) line_brush->Release();
+            HRESULT hr = rt->EndDraw();
+            if (hr == D2DERR_RECREATE_TARGET) {
+                release_tiles();
+                rt->Release();
+                rt = nullptr;
+            }
+            BitBlt(target_hdc, 0, 0, w_px, h_px, mem_dc, 0, 0, SRCCOPY);
+            SelectObject(mem_dc, old_bmp);
+            DeleteObject(mem_bmp);
+            DeleteDC(mem_dc);
+            return;
+        }
+
         // ====================================================================
         // 1. TOP TELEMETRY & TRANSPORT CONTROL BAR (y: 0..62)
         // ====================================================================
         D2D1_RECT_F top_bar = D2D1::RectF(0, 0, W, 62);
         fill_round_rect(top_bar, 0.0f, hex_color(0x0F172A));
 
-        ID2D1SolidColorBrush* line_brush = nullptr;
-        rt->CreateSolidColorBrush(hex_color(0x1E293B), &line_brush);
         if (line_brush) {
             rt->DrawLine(D2D1::Point2F(0, 62), D2D1::Point2F(W, 62), line_brush, 1.5f);
         }
@@ -6261,7 +6410,7 @@ static void handle_left_click(HWND hwnd, POINT pt) {
 #ifdef _WIN32
                     BOOL dark_title = g_app->light_mode ? FALSE : TRUE;
                     DwmSetWindowAttribute(hwnd, 20, &dark_title, sizeof(dark_title));
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && !defined(MESHCORE_IOS)
                     if (hwnd && hwnd->ns_window) {
                         id app_name = mac_ns_str(g_app->light_mode ? "NSAppearanceNameAqua" : "NSAppearanceNameDarkAqua");
                         id appearance = mac_cls_send<id>("NSAppearance", sel_registerName("appearanceNamed:"), app_name);
@@ -6385,6 +6534,11 @@ static void handle_left_click(HWND hwnd, POINT pt) {
                 case BTN_CANCEL_SEND_IMAGE:
                     g_app->cancel_pending_image();
                     break;
+                case BTN_MOB_TAB_CHAT:     g_app->mobile_tab = 0; break;
+                case BTN_MOB_TAB_NODES:    g_app->mobile_tab = 1; break;
+                case BTN_MOB_TAB_SNIFFER:  g_app->mobile_tab = 2; break;
+                case BTN_MOB_TAB_CHANNELS: g_app->mobile_tab = 3; break;
+                case BTN_MOB_TAB_RADIO:    g_app->mobile_tab = 4; break;
             }
             return;
         }
@@ -6901,6 +7055,281 @@ static id ns_str(const char* utf8) {
     return mac_ns_str(utf8);
 }
 
+#ifdef MESHCORE_IOS
+static id g_ios_tf = nullptr;
+static bool g_ios_keyboard_visible = false;
+static int g_ios_top_inset = 48;
+static CGPoint g_ios_touch_start{0.0, 0.0};
+static CGFloat g_ios_last_drag_y = 0.0;
+static bool g_ios_dragging_scroll = false;
+
+static void ios_sync_tf_from_app() {
+    if (!g_ios_tf || !g_app) return;
+    const std::string* src = &g_app->chat_input;
+    if (g_app->active_input == ActiveInputTarget::SnifferFilter) src = &g_app->sniffer_filter;
+    else if (g_app->active_input == ActiveInputTarget::CallsignEditor) src = &g_app->callsign;
+    msg_send<void>(g_ios_tf, sel_registerName("setText:"), ns_str(src->c_str()));
+}
+
+static CGPoint ios_touch_pt(id self, id touches, long* out_taps = nullptr) {
+    id touch = msg_send<id>(touches, sel_registerName("anyObject"));
+    if (!touch) return CGPointMake(0.0, 0.0);
+    if (out_taps) {
+        *out_taps = msg_send<long>(touch, sel_registerName("tapCount"));
+    }
+    CGPoint pt = msg_send<CGPoint>(touch, sel_registerName("locationInView:"), self);
+    pt.y -= static_cast<CGFloat>(g_ios_top_inset);
+    return pt;
+}
+
+static void ios_view_draw_rect(id self, SEL, CGRect) {
+    CGRect bounds = msg_send<CGRect>(self, sel_registerName("bounds"));
+    int raw_w = static_cast<int>(bounds.size.width);
+    int raw_h = static_cast<int>(bounds.size.height);
+    g_ios_top_inset = (raw_h > raw_w && raw_h >= 720) ? 48 : 24;
+    int bot_inset = g_ios_keyboard_visible ? 285 : ((raw_h > raw_w && raw_h >= 720) ? 20 : 0);
+    int new_w = std::max(240, raw_w);
+    int new_h = std::max(280, raw_h - g_ios_top_inset - bot_inset);
+
+    if (new_w != g_mac_win.width || new_h != g_mac_win.height) {
+        g_mac_win.width = new_w;
+        g_mac_win.height = new_h;
+        WndProc(&g_mac_win, WM_SIZE, 0, MAKELPARAM_MAC(new_w, new_h));
+    }
+    CGContextRef cg = UIGraphicsGetCurrentContext();
+    if (!cg) return;
+
+    // Fill status bar + home indicator areas with theme background
+    CGContextSaveGState(cg);
+    if (g_app && g_app->light_mode) {
+        CGContextSetRGBFillColor(cg, 0.945, 0.961, 0.976, 1.0);
+    } else {
+        CGContextSetRGBFillColor(cg, 0.035, 0.051, 0.086, 1.0);
+    }
+    CGContextFillRect(cg, bounds);
+    CGContextTranslateCTM(cg, 0.0, static_cast<CGFloat>(g_ios_top_inset));
+
+    g_mac_win.active_cg = cg;
+    WndProc(&g_mac_win, WM_PAINT, 0, 0);
+    g_mac_win.active_cg = nullptr;
+    CGContextRestoreGState(cg);
+}
+
+static void ios_touches_began(id self, SEL, id touches, id) {
+    long taps = 1;
+    CGPoint pt = ios_touch_pt(self, touches, &taps);
+    g_ios_touch_start = pt;
+    g_ios_last_drag_y = pt.y;
+    g_ios_dragging_scroll = false;
+
+    LPARAM lp = MAKELPARAM_MAC(static_cast<int>(pt.x), static_cast<int>(pt.y));
+    WndProc(&g_mac_win, WM_MOUSEMOVE, 0, lp);
+    if (taps >= 2) {
+        WndProc(&g_mac_win, WM_LBUTTONDBLCLK, 0, lp);
+        msg_send<void>(self, sel_registerName("setNeedsDisplay"));
+        return;
+    }
+    if (g_app && g_app->mobile_tab == 0 && g_app->center_view == CenterView::Map &&
+        D2DRenderer::pt_in_rect(POINT{static_cast<LONG>(pt.x), static_cast<LONG>(pt.y)}, g_app->map_rect)) {
+        WndProc(&g_mac_win, WM_LBUTTONDOWN, 0, lp);
+    }
+    msg_send<void>(self, sel_registerName("setNeedsDisplay"));
+}
+
+static void ios_touches_moved(id self, SEL, id touches, id) {
+    CGPoint pt = ios_touch_pt(self, touches, nullptr);
+    LPARAM lp = MAKELPARAM_MAC(static_cast<int>(pt.x), static_cast<int>(pt.y));
+    if (g_app && g_app->map_dragging) {
+        WndProc(&g_mac_win, WM_MOUSEMOVE, 0, lp);
+        msg_send<void>(self, sel_registerName("setNeedsDisplay"));
+        return;
+    }
+    CGFloat dy = pt.y - g_ios_last_drag_y;
+    if (!g_ios_dragging_scroll && std::abs(pt.y - g_ios_touch_start.y) > 12.0) {
+        g_ios_dragging_scroll = true;
+    }
+    if (g_ios_dragging_scroll && std::abs(dy) >= 18.0) {
+        g_ios_last_drag_y = pt.y;
+        int delta = (dy > 0.0) ? 120 : -120;
+        WPARAM wp = static_cast<WPARAM>(static_cast<uint16_t>(static_cast<int16_t>(delta))) << 16;
+        WndProc(&g_mac_win, WM_MOUSEWHEEL, wp, lp);
+        msg_send<void>(self, sel_registerName("setNeedsDisplay"));
+    }
+}
+
+static void ios_touches_ended(id self, SEL, id touches, id) {
+    CGPoint pt = ios_touch_pt(self, touches, nullptr);
+    LPARAM lp = MAKELPARAM_MAC(static_cast<int>(pt.x), static_cast<int>(pt.y));
+    POINT win_pt{static_cast<LONG>(pt.x), static_cast<LONG>(pt.y)};
+
+    if (g_app && g_app->map_dragging) {
+        WndProc(&g_mac_win, WM_LBUTTONUP, 0, lp);
+        msg_send<void>(self, sel_registerName("setNeedsDisplay"));
+        return;
+    }
+
+    if (!g_ios_dragging_scroll) {
+        bool hit_text_box = false;
+        bool hit_tx_btn = false;
+        if (g_app) {
+            for (const auto& b : g_app->button_hits) {
+                if (D2DRenderer::pt_in_rect(win_pt, b.rect)) {
+                    if (b.id == BTN_CHAT_INPUT_BOX || b.id == BTN_ADD_TAG ||
+                        b.id == BTN_SNIFFER_FILTER_BOX || b.id == BTN_CALLSIGN) {
+                        hit_text_box = true;
+                    } else if (b.id == BTN_TRANSMIT_TX) {
+                        hit_tx_btn = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        WndProc(&g_mac_win, WM_LBUTTONDOWN, 0, lp);
+        WndProc(&g_mac_win, WM_LBUTTONUP, 0, lp);
+
+        if (hit_text_box && g_ios_tf) {
+            ios_sync_tf_from_app();
+            g_ios_keyboard_visible = true;
+            msg_send<ObjcBool>(g_ios_tf, sel_registerName("becomeFirstResponder"));
+        } else if (hit_tx_btn && g_ios_tf) {
+            ios_sync_tf_from_app();
+            g_ios_keyboard_visible = false;
+            msg_send<ObjcBool>(g_ios_tf, sel_registerName("resignFirstResponder"));
+        } else if (g_ios_keyboard_visible && g_ios_tf) {
+            g_ios_keyboard_visible = false;
+            msg_send<ObjcBool>(g_ios_tf, sel_registerName("resignFirstResponder"));
+        }
+    }
+    g_ios_dragging_scroll = false;
+    msg_send<void>(self, sel_registerName("setNeedsDisplay"));
+}
+
+static void ios_on_text_changed(id self, SEL, id sender) {
+    if (!g_app || !sender) return;
+    id txt_obj = msg_send<id>(sender, sel_registerName("text"));
+    std::string val = mac_ns_to_std_str(txt_obj);
+    if (g_app->active_input == ActiveInputTarget::ChatComposer) {
+        g_app->chat_input = val;
+        g_app->chat_cursor = g_app->chat_input.size();
+    } else if (g_app->active_input == ActiveInputTarget::SnifferFilter) {
+        g_app->sniffer_filter = val;
+        g_app->sniffer_scroll = 0;
+    } else if (g_app->active_input == ActiveInputTarget::CallsignEditor) {
+        std::string clean;
+        for (unsigned char c : val) {
+            if (clean.size() < 14 && c >= 0x21 && c < 0x7F && c != ':') {
+                clean.push_back(static_cast<char>(std::toupper(c)));
+            }
+        }
+        g_app->callsign = clean;
+    }
+    msg_send<void>(self, sel_registerName("setNeedsDisplay"));
+}
+
+static void ios_on_text_return(id self, SEL, id sender) {
+    if (g_app) {
+        WndProc(&g_mac_win, WM_KEYDOWN, VK_RETURN, 0);
+        ios_sync_tf_from_app();
+    }
+    g_ios_keyboard_visible = false;
+    if (sender) {
+        msg_send<ObjcBool>(sender, sel_registerName("resignFirstResponder"));
+    }
+    msg_send<void>(self, sel_registerName("setNeedsDisplay"));
+}
+
+static void ios_view_on_tick(id self, SEL, id) {
+    WndProc(&g_mac_win, WM_TIMER, 1, 0);
+    msg_send<void>(self, sel_registerName("setNeedsDisplay"));
+}
+
+static ObjcBool ios_app_did_finish_launching(id, SEL, id, id) {
+    g_ios_on_image_picked = [](const std::wstring& wpath) {
+        if (g_app && !wpath.empty()) {
+            g_app->attach_image_from_path(wpath);
+        }
+    };
+
+    id screen = cls_send<id>("UIScreen", sel_registerName("mainScreen"));
+    CGRect bounds = screen ? msg_send<CGRect>(screen, sel_registerName("bounds"))
+                           : CGRectMake(0.0, 0.0, 393.0, 852.0);
+
+    id win_alloc = cls_send<id>("UIWindow", sel_registerName("alloc"));
+    id window = msg_send<id>(win_alloc, sel_registerName("initWithFrame:"), bounds);
+
+    id vc_alloc = cls_send<id>("UIViewController", sel_registerName("alloc"));
+    id vc = msg_send<id>(vc_alloc, sel_registerName("init"));
+
+    Class view_cls = objc_getClass("MeshCoreIOSView");
+    id view_alloc = msg_send<id>(reinterpret_cast<id>(view_cls), sel_registerName("alloc"));
+    id view = msg_send<id>(view_alloc, sel_registerName("initWithFrame:"), bounds);
+    // UIViewAutoresizingFlexibleWidth (2) | UIViewAutoresizingFlexibleHeight (16) = 18
+    msg_send<void>(view, sel_registerName("setAutoresizingMask:"), static_cast<unsigned long>(18));
+
+    // Off-screen UITextField to bridge native iOS keyboard events + Return key
+    id tf_alloc = cls_send<id>("UITextField", sel_registerName("alloc"));
+    g_ios_tf = msg_send<id>(tf_alloc, sel_registerName("initWithFrame:"), CGRectMake(-2000.0, -2000.0, 120.0, 32.0));
+    if (g_ios_tf) {
+        // UIKeyboardAppearanceDark = 1, UIReturnKeySend = 7, UITextAutocorrectionTypeNo = 1
+        msg_send<void>(g_ios_tf, sel_registerName("setKeyboardAppearance:"), static_cast<long>(1));
+        msg_send<void>(g_ios_tf, sel_registerName("setReturnKeyType:"), static_cast<long>(7));
+        msg_send<void>(g_ios_tf, sel_registerName("setAutocorrectionType:"), static_cast<long>(1));
+        // UIControlEventEditingChanged = (1 << 17), UIControlEventEditingDidEndOnExit = (1 << 19)
+        msg_send<void>(g_ios_tf, sel_registerName("addTarget:action:forControlEvents:"),
+                       view, sel_registerName("onTextChanged:"), static_cast<unsigned long>(1UL << 17));
+        msg_send<void>(g_ios_tf, sel_registerName("addTarget:action:forControlEvents:"),
+                       view, sel_registerName("onTextReturn:"), static_cast<unsigned long>(1UL << 19));
+        msg_send<void>(view, sel_registerName("addSubview:"), g_ios_tf);
+    }
+
+    msg_send<void>(vc, sel_registerName("setView:"), view);
+    msg_send<void>(window, sel_registerName("setRootViewController:"), vc);
+    msg_send<void>(window, sel_registerName("makeKeyAndVisible"));
+
+    g_mac_win.ns_window = window;
+    g_mac_win.ns_view = view;
+    g_mac_win.ios_vc = vc;
+
+    // 30 FPS UI + RF telemetry timer (33ms)
+    cls_send<id>("NSTimer",
+                 sel_registerName("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+                 0.033, view, sel_registerName("onTick:"), static_cast<id>(nullptr), static_cast<ObjcBool>(1));
+
+    // Automatically begin BLE NUS scan on iOS launch
+    if (g_app) {
+        g_app->connected_port = "BLE";
+        g_app->log_public_system("[iOS BLE] Scanning Bluetooth LE for SenseCAP T1000-E / Heltec V3 (NUS)...");
+        g_app->transport.connect_ble("");
+    }
+    return static_cast<ObjcBool>(1);
+}
+
+int main(int argc, char** argv) {
+    MeshGuiApp app;
+    D2DRenderer renderer;
+    g_app = &app;
+    g_renderer = &renderer;
+
+    Class view_cls = objc_allocateClassPair(objc_getClass("UIView"), "MeshCoreIOSView", 0);
+    class_addMethod(view_cls, sel_registerName("drawRect:"), reinterpret_cast<IMP>(ios_view_draw_rect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+    class_addMethod(view_cls, sel_registerName("touchesBegan:withEvent:"), reinterpret_cast<IMP>(ios_touches_began), "v@:@@");
+    class_addMethod(view_cls, sel_registerName("touchesMoved:withEvent:"), reinterpret_cast<IMP>(ios_touches_moved), "v@:@@");
+    class_addMethod(view_cls, sel_registerName("touchesEnded:withEvent:"), reinterpret_cast<IMP>(ios_touches_ended), "v@:@@");
+    class_addMethod(view_cls, sel_registerName("touchesCancelled:withEvent:"), reinterpret_cast<IMP>(ios_touches_ended), "v@:@@");
+    class_addMethod(view_cls, sel_registerName("onTextChanged:"), reinterpret_cast<IMP>(ios_on_text_changed), "v@:@");
+    class_addMethod(view_cls, sel_registerName("onTextReturn:"), reinterpret_cast<IMP>(ios_on_text_return), "v@:@");
+    class_addMethod(view_cls, sel_registerName("onTick:"), reinterpret_cast<IMP>(ios_view_on_tick), "v@:@");
+    objc_registerClassPair(view_cls);
+
+    Class del_cls = objc_allocateClassPair(objc_getClass("NSObject"), "MeshCoreIOSAppDelegate", 0);
+    class_addMethod(del_cls, sel_registerName("application:didFinishLaunchingWithOptions:"),
+                    reinterpret_cast<IMP>(ios_app_did_finish_launching), "B@:@@");
+    objc_registerClassPair(del_cls);
+
+    return UIApplicationMain(argc, argv, nullptr, ns_str("MeshCoreIOSAppDelegate"));
+}
+#else
 static CGPoint event_pt_in_view(id self, id event) {
     CGPoint win_pt = msg_send<CGPoint>(event, sel_registerName("locationInWindow"));
     return msg_send<CGPoint>(self, sel_registerName("convertPoint:fromView:"), win_pt, static_cast<id>(nullptr));
@@ -7167,6 +7596,7 @@ int main(int, char** argv) {
     g_renderer = nullptr;
     return 0;
 }
+#endif // MESHCORE_IOS
 #endif
 
 

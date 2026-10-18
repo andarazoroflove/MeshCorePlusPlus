@@ -595,12 +595,55 @@ inline bool load_and_encode_image_file(const std::wstring& path,
         return false;
     }
     return true;
+#else
+    (void)out_bytes;
+    out_error = "Use encode_rgba_to_mono_bitmap directly on this platform.";
+    return false;
 #endif
 }
+
+#ifdef MESHCORE_IOS
+inline void ios_img_picker_did_finish(id, SEL, id picker, id info) {
+    if (picker) {
+        mac_msg_send<void>(picker, sel_registerName("dismissViewControllerAnimated:completion:"),
+                           static_cast<ObjcBool>(1), static_cast<id>(nullptr));
+    }
+    if (!info) return;
+    id ui_img = mac_msg_send<id>(info, sel_registerName("objectForKey:"),
+                                 mac_ns_str("UIImagePickerControllerEditedImage"));
+    if (!ui_img) {
+        ui_img = mac_msg_send<id>(info, sel_registerName("objectForKey:"),
+                                  mac_ns_str("UIImagePickerControllerOriginalImage"));
+    }
+    if (!ui_img) return;
+    id png_data = UIImagePNGRepresentation(ui_img);
+    if (!png_data) return;
+
+    std::string dir = "/tmp";
+    if (const char* home = std::getenv("HOME")) {
+        dir = std::string(home) + "/Library/Application Support/MeshCore++";
+        mkdir(dir.c_str(), 0755);
+    }
+    std::string out_path = dir + "/ios_picked_image.png";
+    mac_msg_send<ObjcBool>(png_data, sel_registerName("writeToFile:atomically:"),
+                           mac_ns_str(out_path.c_str()), static_cast<ObjcBool>(1));
+    if (g_ios_on_image_picked) {
+        g_ios_on_image_picked(mac_utf8_to_wide(out_path));
+    }
+}
+
+inline void ios_img_picker_did_cancel(id, SEL, id picker) {
+    if (picker) {
+        mac_msg_send<void>(picker, sel_registerName("dismissViewControllerAnimated:completion:"),
+                           static_cast<ObjcBool>(1), static_cast<id>(nullptr));
+    }
+}
+#endif
 
 // ============================================================================
 // Native OS File Picker Dialog (*.heic, *.png, *.jpg, *.jpeg, *.bmp)
 // ============================================================================
+#if defined(_WIN32) || defined(__APPLE__)
 inline std::wstring open_image_file_dialog(HWND hwnd) {
 #ifdef _WIN32
     wchar_t file_buf[MAX_PATH] = {0};
@@ -616,6 +659,33 @@ inline std::wstring open_image_file_dialog(HWND hwnd) {
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (GetOpenFileNameW(&ofn)) {
         return std::wstring(file_buf);
+    }
+    return L"";
+#elif defined(MESHCORE_IOS)
+    if (!hwnd || !hwnd->ios_vc) return L"";
+    static id s_delegate = nullptr;
+    if (!s_delegate) {
+        Class del_cls = objc_allocateClassPair(objc_getClass("NSObject"), "MeshCoreIOSImgPickerDelegate", 0);
+        if (del_cls) {
+            class_addMethod(del_cls, sel_registerName("imagePickerController:didFinishPickingMediaWithInfo:"),
+                            reinterpret_cast<IMP>(ios_img_picker_did_finish), "v@:@@");
+            class_addMethod(del_cls, sel_registerName("imagePickerControllerDidCancel:"),
+                            reinterpret_cast<IMP>(ios_img_picker_did_cancel), "v@:@");
+            objc_registerClassPair(del_cls);
+            s_delegate = mac_msg_send<id>(
+                mac_msg_send<id>(reinterpret_cast<id>(del_cls), sel_registerName("alloc")),
+                sel_registerName("init"));
+        }
+    }
+    id picker = mac_msg_send<id>(
+        mac_cls_send<id>("UIImagePickerController", sel_registerName("alloc")),
+        sel_registerName("init"));
+    if (picker) {
+        // UIImagePickerControllerSourceTypePhotoLibrary = 0
+        mac_msg_send<void>(picker, sel_registerName("setSourceType:"), static_cast<long>(0));
+        mac_msg_send<void>(picker, sel_registerName("setDelegate:"), s_delegate);
+        mac_msg_send<void>(hwnd->ios_vc, sel_registerName("presentViewController:animated:completion:"),
+                           picker, static_cast<ObjcBool>(1), static_cast<id>(nullptr));
     }
     return L"";
 #elif defined(__APPLE__)
@@ -646,5 +716,6 @@ inline std::wstring open_image_file_dialog(HWND hwnd) {
     return mac_utf8_to_wide(utf8);
 #endif
 }
+#endif
 
 } // namespace meshirc
