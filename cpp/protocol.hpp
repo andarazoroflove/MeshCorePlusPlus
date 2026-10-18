@@ -135,6 +135,32 @@ inline std::vector<uint8_t> build_cmd_send_channel_txt_msg(uint8_t slot_idx,
     return p;
 }
 
+// Builds the exact 181-byte single-packet RF payload: [Byte 0 = 0x49 ('I'), Bytes 1..180 = packed bitmap]
+inline std::vector<uint8_t> build_raw_mono_img_packet(const std::array<uint8_t, MONO_IMG_BYTES>& bits) {
+    std::vector<uint8_t> p(MONO_IMG_RF_BYTES);
+    p[0] = PAYLOAD_TYPE_MONO_IMG;
+    std::memcpy(p.data() + 1, bits.data(), MONO_IMG_BYTES);
+    return p;
+}
+
+// Wraps the single-packet 0x49 ('I!') payload into a channel dispatch command preserving routing headers
+inline std::vector<uint8_t> build_cmd_send_channel_mono_img(uint8_t slot_idx,
+                                                            uint32_t timestamp,
+                                                            const std::array<uint8_t, MONO_IMG_BYTES>& bits) {
+    std::string wire = encode_mono_img_companion_wire(bits);
+    std::vector<uint8_t> p;
+    p.reserve(7 + wire.size());
+    p.push_back(CMD_SEND_CHANNEL_TXT_MSG);
+    p.push_back(TXT_TYPE_PLAIN); // 0x00 so stock MeshCore v1.17+ companion firmware accepts & broadcasts over RF
+    p.push_back(slot_idx);
+    p.push_back(static_cast<uint8_t>(timestamp & 0xFF));
+    p.push_back(static_cast<uint8_t>((timestamp >> 8) & 0xFF));
+    p.push_back(static_cast<uint8_t>((timestamp >> 16) & 0xFF));
+    p.push_back(static_cast<uint8_t>((timestamp >> 24) & 0xFF));
+    p.insert(p.end(), wire.begin(), wire.end()); // Byte 0 of RF payload = 0x49 ('I'), Byte 1 = '!'
+    return p;
+}
+
 inline std::vector<uint8_t> build_cmd_send_txt_msg(const std::array<uint8_t, 6>& pubkey_prefix,
                                                    uint32_t timestamp,
                                                    const std::string& text,
@@ -281,6 +307,8 @@ struct DecodedRadioPacket {
     uint8_t login_permissions = 0;
     std::string sender;
     std::string text;
+    bool is_mono_img = false;
+    std::array<uint8_t, MONO_IMG_BYTES> mono_img_bytes{};
     std::vector<uint8_t> encrypted_frame;
     std::vector<uint8_t> raw;      // full companion payload as received (for hex inspector)
     uint8_t route_type = 0xFF;     // LoRa route type for PUSH_LOG_RX_DATA (0xFF = n/a)
@@ -303,6 +331,89 @@ inline void split_sender_and_text(const std::string& raw, std::string& sender, s
     }
 }
 
+// Extracts a 1-bit tactical bitmap (opcode 0x49) from a channel message body if present.
+// Returns: 1 = extracted valid 180-byte mono image, -1 = recognized 0x49 opcode but truncated/corrupt (ignore), 0 = normal text
+inline int try_extract_channel_mono_img(const uint8_t* data,
+                                        size_t rem_len,
+                                        uint8_t txt_type,
+                                        std::string& out_sender,
+                                        std::array<uint8_t, MONO_IMG_BYTES>& out_bits) {
+    if (rem_len == 0) return (txt_type == PAYLOAD_TYPE_MONO_IMG) ? -1 : 0;
+
+    // Case 1a: Direct companion-safe [0x49 ('I'), '!', 120_Base91_chars]
+    if (rem_len >= 2 && data[0] == PAYLOAD_TYPE_MONO_IMG && data[1] == '!') {
+        if (rem_len >= MONO_IMG_WIRE_LEN && decode_mono_img_companion_wire(data, rem_len, out_bits)) {
+            out_sender = "Station";
+            return 1;
+        }
+        return -1;
+    }
+
+    // Case 1b: Direct raw [0x49, 180_bytes]
+    if (data[0] == PAYLOAD_TYPE_MONO_IMG && rem_len >= MONO_IMG_RF_BYTES) {
+        out_sender = "Station";
+        std::memcpy(out_bits.data(), data + 1, MONO_IMG_BYTES);
+        return 1;
+    }
+
+    // Case 2: ["Sender: ", 0x49, ...] (also supports UTF-8 callsigns and optional 4B signed plain prefix)
+    auto scan_with_offset = [&](size_t start_off) -> int {
+        if (start_off + 4 >= rem_len) return 0;
+        size_t max_scan = std::min<size_t>(rem_len - start_off, 70);
+        size_t colon_pos = std::string::npos;
+        for (size_t i = 0; i + 1 < max_scan; ++i) {
+            uint8_t c = data[start_off + i];
+            if (c == ':' && data[start_off + i + 1] == ' ') {
+                colon_pos = i;
+                break;
+            }
+            if (c < 0x20 || c == 0x7F) break;
+        }
+        if (colon_pos == std::string::npos || colon_pos == 0) return 0;
+
+        size_t body_off = start_off + colon_pos + 2;
+        if (body_off + 2 <= rem_len && data[body_off] == PAYLOAD_TYPE_MONO_IMG && data[body_off + 1] == '!') {
+            if (body_off + MONO_IMG_WIRE_LEN <= rem_len &&
+                decode_mono_img_companion_wire(data + body_off, rem_len - body_off, out_bits)) {
+                out_sender = trim_str(std::string(reinterpret_cast<const char*>(data + start_off), colon_pos));
+                if (out_sender.empty()) out_sender = "Station";
+                return 1;
+            }
+            return -1;
+        }
+        if (body_off + MONO_IMG_RF_BYTES <= rem_len && data[body_off] == PAYLOAD_TYPE_MONO_IMG) {
+            out_sender = trim_str(std::string(reinterpret_cast<const char*>(data + start_off), colon_pos));
+            if (out_sender.empty()) out_sender = "Station";
+            std::memcpy(out_bits.data(), data + body_off + 1, MONO_IMG_BYTES);
+            return 1;
+        }
+        if (txt_type == PAYLOAD_TYPE_MONO_IMG && body_off + MONO_IMG_BYTES <= rem_len) {
+            out_sender = trim_str(std::string(reinterpret_cast<const char*>(data + start_off), colon_pos));
+            if (out_sender.empty()) out_sender = "Station";
+            std::memcpy(out_bits.data(), data + body_off, MONO_IMG_BYTES);
+            return 1;
+        }
+        return 0;
+    };
+
+    if (int rc = scan_with_offset(0); rc != 0) return rc;
+    if (((txt_type & 0x0F) == TXT_TYPE_SIGNED_PLAIN || ((txt_type >> 2) & 0x0F) == TXT_TYPE_SIGNED_PLAIN)) {
+        if (int rc = scan_with_offset(4); rc != 0) return rc;
+    }
+
+    // Case 3: txt_type == 0x49 and raw 180 bytes directly at data[0..179]
+    if (txt_type == PAYLOAD_TYPE_MONO_IMG) {
+        if (rem_len >= MONO_IMG_BYTES) {
+            out_sender = "Station";
+            std::memcpy(out_bits.data(), data, MONO_IMG_BYTES);
+            return 1;
+        }
+        return -1; // Truncated 0x49 frame: gracefully ignore
+    }
+
+    return 0;
+}
+
 inline uint32_t read_u32_le(const uint8_t* p) {
     return static_cast<uint32_t>(p[0]) |
            (static_cast<uint32_t>(p[1]) << 8) |
@@ -320,6 +431,25 @@ inline std::optional<DecodedRadioPacket> parse_companion_payload(const std::vect
     uint8_t code = payload[0];
     pkt.raw_code = code;
     pkt.raw = payload;
+
+    // Direct 181-byte single-packet PAYLOAD_TYPE_MONO_IMG (0x49) frame: [0x49, 180_bytes]
+    if (code == PAYLOAD_TYPE_MONO_IMG) {
+        if (payload.size() >= MONO_IMG_RF_BYTES) {
+            pkt.kind = RadioPacketKind::ChannelMsgRecv;
+            pkt.slot_idx = 0;
+            pkt.txt_type = PAYLOAD_TYPE_MONO_IMG;
+            pkt.sender = "Station";
+            pkt.text = "[1-Bit Tactical Bitmap 48x30]";
+            pkt.is_mono_img = true;
+            pkt.snr = 8.0f;
+            pkt.rssi = -78;
+            std::memcpy(pkt.mono_img_bytes.data(), payload.data() + 1, MONO_IMG_BYTES);
+            return pkt;
+        }
+        // Gracefully ignore truncated 0x49 frame without printing corrupted binary characters
+        pkt.kind = RadioPacketKind::Unknown;
+        return pkt;
+    }
 
     switch (code) {
         case RESP_CODE_OK:
@@ -457,13 +587,24 @@ inline std::optional<DecodedRadioPacket> parse_companion_payload(const std::vect
 
         case RESP_CHANNEL_MSG_RECV:
             if (payload.size() >= 8) {
-                pkt.kind = RadioPacketKind::ChannelMsgRecv;
                 pkt.slot_idx = payload[1];
                 pkt.hops = (payload[2] == 0xFF) ? 0 : (payload[2] & 0x3F);
                 pkt.txt_type = payload[3];
                 pkt.timestamp = read_u32_le(payload.data() + 4);
                 pkt.snr = 7.0f;
                 pkt.rssi = -80;
+                int img_rc = try_extract_channel_mono_img(payload.data() + 8, payload.size() - 8,
+                                                          pkt.txt_type, pkt.sender, pkt.mono_img_bytes);
+                if (img_rc == 1) {
+                    pkt.kind = RadioPacketKind::ChannelMsgRecv;
+                    pkt.is_mono_img = true;
+                    pkt.text = "[1-Bit Tactical Bitmap 48x30]";
+                    return pkt;
+                } else if (img_rc < 0) {
+                    pkt.kind = RadioPacketKind::Unknown;
+                    return pkt;
+                }
+                pkt.kind = RadioPacketKind::ChannelMsgRecv;
                 std::string raw_txt = read_cstr_slice(payload.data() + 8, payload.size() - 8);
                 if (((pkt.txt_type & 0x0F) == TXT_TYPE_SIGNED_PLAIN || ((pkt.txt_type >> 2) & 0x0F) == TXT_TYPE_SIGNED_PLAIN) &&
                     payload.size() > 12 && raw_txt.find(": ") == std::string::npos) {
@@ -477,13 +618,24 @@ inline std::optional<DecodedRadioPacket> parse_companion_payload(const std::vect
 
         case RESP_CHANNEL_MSG_RECV_V3:
             if (payload.size() >= 11) {
-                pkt.kind = RadioPacketKind::ChannelMsgRecv;
                 pkt.snr = static_cast<float>(static_cast<int8_t>(payload[1])) / 4.0f;
                 pkt.rssi = (payload[2] != 0) ? static_cast<int16_t>(static_cast<int8_t>(payload[2])) : -82;
                 pkt.slot_idx = payload[4];
                 pkt.hops = (payload[5] == 0xFF) ? 0 : (payload[5] & 0x3F);
                 pkt.txt_type = payload[6];
                 pkt.timestamp = read_u32_le(payload.data() + 7);
+                int img_rc = try_extract_channel_mono_img(payload.data() + 11, payload.size() - 11,
+                                                          pkt.txt_type, pkt.sender, pkt.mono_img_bytes);
+                if (img_rc == 1) {
+                    pkt.kind = RadioPacketKind::ChannelMsgRecv;
+                    pkt.is_mono_img = true;
+                    pkt.text = "[1-Bit Tactical Bitmap 48x30]";
+                    return pkt;
+                } else if (img_rc < 0) {
+                    pkt.kind = RadioPacketKind::Unknown;
+                    return pkt;
+                }
+                pkt.kind = RadioPacketKind::ChannelMsgRecv;
                 std::string raw_txt = read_cstr_slice(payload.data() + 11, payload.size() - 11);
                 if (((pkt.txt_type & 0x0F) == TXT_TYPE_SIGNED_PLAIN || ((pkt.txt_type >> 2) & 0x0F) == TXT_TYPE_SIGNED_PLAIN) &&
                     payload.size() > 15 && raw_txt.find(": ") == std::string::npos) {
@@ -604,6 +756,14 @@ inline std::optional<DecodedRadioPacket> parse_companion_payload(const std::vect
             size_t raw_len = payload.size() - 3;
             pkt.lora_raw_len = raw_len;
 
+            // Direct 181-byte [0x49, 180_bytes] over-the-air frame
+            if (raw_len == MONO_IMG_RF_BYTES && raw[0] == PAYLOAD_TYPE_MONO_IMG) {
+                pkt.kind = RadioPacketKind::RawSniffedGroupFrame;
+                pkt.lora_payload_type = PAYLOAD_TYPE_MONO_IMG;
+                pkt.encrypted_frame.assign(raw, raw + raw_len);
+                return pkt;
+            }
+
             uint8_t header = raw[0];
             uint8_t route_type = header & 0x03;
             pkt.route_type = route_type;
@@ -638,10 +798,15 @@ inline std::optional<DecodedRadioPacket> parse_companion_payload(const std::vect
                 idx += path_bytes_len;
             }
 
-            if (payload_type == 0x05 && idx + 17 <= raw_len) {
-                // PAYLOAD_TYPE_GRP_TXT (0x05): [channel_hash(1B), cipher_mac(2B), aes128_ciphertext(16*N)]
+            if ((payload_type == 0x05 || payload_type == 0x06 || payload_type == 0x0F) && idx + 17 <= raw_len) {
+                // PAYLOAD_TYPE_GRP_TXT (0x05) / GRP_DATA (0x06) / RAW_CUSTOM (0x0F)
                 pkt.kind = RadioPacketKind::RawSniffedGroupFrame;
                 pkt.encrypted_frame.assign(raw + idx, raw + raw_len);
+                return pkt;
+            } else if (idx + MONO_IMG_RF_BYTES <= raw_len && raw[idx] == PAYLOAD_TYPE_MONO_IMG) {
+                pkt.kind = RadioPacketKind::RawSniffedGroupFrame;
+                pkt.lora_payload_type = PAYLOAD_TYPE_MONO_IMG;
+                pkt.encrypted_frame.assign(raw + idx, raw + idx + MONO_IMG_RF_BYTES);
                 return pkt;
             } else if (payload_type == 0x04 && idx + 101 <= raw_len) {
                 // PAYLOAD_TYPE_ADVERT (0x04): [pub_key(32B), ts(4B), sig(64B), app_data...]

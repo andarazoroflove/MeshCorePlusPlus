@@ -35,6 +35,7 @@
 #include "crypto.hpp"
 #include "protocol.hpp"
 #include "transport.hpp"
+#include "image_encoder.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -423,6 +424,7 @@ static const char* lora_payload_name(uint8_t pt) {
         case 0x09: return "TRACE";
         case 0x0A: return "MULTIPART";
         case 0x0F: return "RAW_CUSTOM";
+        case 0x49: return "MONO_IMG";
         default:   return "PAYLOAD?";
     }
 }
@@ -673,6 +675,8 @@ struct ChatMessage {
     bool is_system = false;
     bool is_mention = false;
     bool is_self = false;
+    bool has_mono_image = false;
+    std::array<uint8_t, MONO_IMG_BYTES> mono_image{};
     std::string trace_key;              // channel|sender|text, used to merge later flood copies
     std::vector<MessageRoute> routes;   // every distinct repeater path this message was heard over
 };
@@ -913,6 +917,17 @@ public:
     int history_idx = -1;
     std::string selected_station;
     std::string replying_to_user;
+
+    // Pending 1-Bit Tactical Monochrome Bitmap attachment state (48x30, 180B packed, 181B opcode 0x49)
+    bool pending_image_ready = false;
+    std::array<uint8_t, MONO_IMG_BYTES> pending_image_bits{};
+    std::string pending_image_name;
+    std::mutex pending_image_mtx;
+    bool async_img_done = false;
+    bool async_img_ok = false;
+    std::array<uint8_t, MONO_IMG_BYTES> async_img_bits{};
+    std::string async_img_error;
+    std::string async_img_filename;
 
     ActiveInputTarget active_input = ActiveInputTarget::ChatComposer;
     bool serial_dropdown_open = false;
@@ -1264,7 +1279,8 @@ public:
                   << '\t' << static_cast<int>(m.hops)
                   << '\t' << tsv_escape(m.text)
                   << '\t' << (m.is_mention ? 1 : 0)
-                  << '\t' << (m.is_self ? 1 : 0) << '\n';
+                  << '\t' << (m.is_self ? 1 : 0)
+                  << '\t' << (m.has_mono_image ? hex_string(m.mono_image.data(), MONO_IMG_BYTES, "") : "") << '\n';
             }
         }
         state_dirty = false;
@@ -1400,6 +1416,11 @@ public:
                             m.text = cols[8];
                             m.is_mention = std::stoi(cols[9]) != 0;
                             m.is_self = std::stoi(cols[10]) != 0;
+                            if (cols.size() >= 12 && cols[11].size() == MONO_IMG_BYTES * 2) {
+                                if (hex_to_bytes(cols[11], m.mono_image.data(), MONO_IMG_BYTES)) {
+                                    m.has_mono_image = true;
+                                }
+                            }
                             tab.messages.push_back(std::move(m));
                             ++loaded_msgs;
                             break;
@@ -1490,6 +1511,26 @@ public:
         auto events = transport.drain_events();
         for (auto& ev : events) {
             handle_event(ev);
+        }
+        bool auto_send_now = false;
+        {
+            std::lock_guard<std::mutex> lk(pending_image_mtx);
+            if (async_img_done) {
+                async_img_done = false;
+                if (async_img_ok) {
+                    pending_image_bits = async_img_bits;
+                    pending_image_name = async_img_filename;
+                    pending_image_ready = true;
+                    auto_send_now = true;
+                    log_console("[IMAGE ENCODER] Dithered '" + pending_image_name +
+                                "' -> 48x30 1-bit Floyd-Steinberg (180B payload / 181B opcode 0x49). Auto-transmitting...");
+                } else {
+                    log_active_tab("[IMAGE ENCODER ERROR] " + async_img_error);
+                }
+            }
+        }
+        if (auto_send_now) {
+            confirm_send_pending_image();
         }
         if (state_dirty && now_epoch_secs() >= last_state_save_epoch + 8) {
             save_state();
@@ -1784,7 +1825,8 @@ public:
                 record_rf_metrics(pkt.rssi, pkt.snr, 48);
                 record_node_snr_by_name(pkt.sender, pkt.rssi, pkt.snr, pkt.hops);
                 std::string ch = hw_slots.channel_for_slot(pkt.slot_idx);
-                ingest_decrypted_message(ch, pkt.sender, pkt.text, pkt.rssi, pkt.snr, pkt.hops, "");
+                ingest_decrypted_message(ch, pkt.sender, pkt.text, pkt.rssi, pkt.snr, pkt.hops, "", nullptr,
+                                         pkt.is_mono_img ? &pkt.mono_img_bytes : nullptr);
                 break;
             }
             case RadioPacketKind::DirectMsgRecv: {
@@ -1896,7 +1938,8 @@ public:
                     route.snr = pkt.snr;
                     route.time = now_hms_str();
                     ingest_decrypted_message(sniffed->channel_name, sniffed->sender, sniffed->text,
-                                             pkt.rssi, pkt.snr, pkt.hops, path_desc, &route);
+                                             pkt.rssi, pkt.snr, pkt.hops, path_desc, &route,
+                                             sniffed->is_mono_img ? &sniffed->mono_img_bytes : nullptr);
                 } else if (!pkt.encrypted_frame.empty()) {
                     std::ostringstream oss;
                     oss << "[RF GROUP PKT] Encrypted channel frame (Bucket 0x"
@@ -2041,9 +2084,15 @@ public:
             r.details.push_back("Set channel slot " + std::to_string(payload[1]) + " -> " + name +
                                 (payload.size() >= 50 ? ("  PSK " + hex_string(payload.data() + 34, 16, "")) : ""));
         } else if (r.code == 0x03 && payload.size() > 7) {
-            std::string text(reinterpret_cast<const char*>(payload.data() + 7), payload.size() - 7);
-            r.summary += "  slot " + std::to_string(payload[2]) + ": " + text;
-            r.details.push_back("Channel slot " + std::to_string(payload[2]) + " text: " + text);
+            if (payload[1] == PAYLOAD_TYPE_MONO_IMG || payload[7] == PAYLOAD_TYPE_MONO_IMG) {
+                std::string text = "[0x49 MONO_IMG 48x30 (181B)]";
+                r.summary += "  slot " + std::to_string(payload[2]) + ": " + text;
+                r.details.push_back("Channel slot " + std::to_string(payload[2]) + " 1-bit bitmap: " + text);
+            } else {
+                std::string text(reinterpret_cast<const char*>(payload.data() + 7), payload.size() - 7);
+                r.summary += "  slot " + std::to_string(payload[2]) + ": " + text;
+                r.details.push_back("Channel slot " + std::to_string(payload[2]) + " text: " + text);
+            }
         } else if (r.code == 0x02 && payload.size() > 13) {
             std::string khex = hex_string(payload.data() + 7, 6, "");
             std::string text(reinterpret_cast<const char*>(payload.data() + 13), payload.size() - 13);
@@ -2734,7 +2783,8 @@ public:
                                   float snr,
                                   uint8_t hops,
                                   const std::string& path_desc = "",
-                                  const MessageRoute* route = nullptr) {
+                                  const MessageRoute* route = nullptr,
+                                  const std::array<uint8_t, MONO_IMG_BYTES>* mono_img = nullptr) {
         std::string ch = (normalize_channel_name(raw_ch) == PUBLIC_CHANNEL_NAME)
                              ? PUBLIC_CHANNEL_NAME
                              : raw_ch;
@@ -2744,7 +2794,8 @@ public:
         while (!recent_dedup.empty() && now_s > recent_dedup.front().epoch_sec + 45) {
             recent_dedup.pop_front();
         }
-        std::string dedup_key = normalize_channel_name(ch) + "|" + sender + "|" + text;
+        std::string dedup_payload = mono_img ? hex_string(mono_img->data(), 24, "") : text;
+        std::string dedup_key = normalize_channel_name(ch) + "|" + sender + "|" + dedup_payload;
         for (const auto& item : recent_dedup) {
             if (item.key == dedup_key) {
                 // Already displayed: attach this copy's repeater path to the message's trace
@@ -2761,37 +2812,46 @@ public:
             register_or_update_discovered(ch, true, rssi, snr, false);
         }
 
-        // Scrape #hashtags via regex/scanner
-        for (const auto& tag : extract_hashtags(text)) {
-            bool was_known = rainbow.contains(tag);
-            auto cand = rainbow.add_channel(tag);
-            bool already_disc = false;
-            for (const auto& d : discovered) {
-                if (d.name == cand.name) { already_disc = true; break; }
-            }
-            register_or_update_discovered(cand.name, false, 0, 0.0f, true);
-            if (!already_disc) {
-                std::ostringstream oss;
-                oss << "[SNIFFER] Scraped " << cand.name << " (hash=0x"
-                    << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
-                    << static_cast<int>(cand.channel_hash) << ") from <" << sender << "> in " << ch
-                    << (was_known ? "" : " [Added to 256-bucket table]");
-                log_console(oss.str());
+        // Scrape #hashtags via regex/scanner (only for plain-text messages)
+        if (!mono_img) {
+            for (const auto& tag : extract_hashtags(text)) {
+                bool was_known = rainbow.contains(tag);
+                auto cand = rainbow.add_channel(tag);
+                bool already_disc = false;
+                for (const auto& d : discovered) {
+                    if (d.name == cand.name) { already_disc = true; break; }
+                }
+                register_or_update_discovered(cand.name, false, 0, 0.0f, true);
+                if (!already_disc) {
+                    std::ostringstream oss;
+                    oss << "[SNIFFER] Scraped " << cand.name << " (hash=0x"
+                        << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
+                        << static_cast<int>(cand.channel_hash) << ") from <" << sender << "> in " << ch
+                        << (was_known ? "" : " [Added to 256-bucket table]");
+                    log_console(oss.str());
+                }
             }
         }
 
-        std::string lower_txt = text;
-        std::string lower_call = callsign;
-        std::transform(lower_txt.begin(), lower_txt.end(), lower_txt.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        std::transform(lower_call.begin(), lower_call.end(), lower_call.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        bool is_mention = !lower_call.empty() && lower_txt.find(lower_call) != std::string::npos;
+        bool is_mention = false;
+        if (!mono_img) {
+            std::string lower_txt = text;
+            std::string lower_call = callsign;
+            std::transform(lower_txt.begin(), lower_txt.end(), lower_txt.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            std::transform(lower_call.begin(), lower_call.end(), lower_call.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            is_mention = !lower_call.empty() && lower_txt.find(lower_call) != std::string::npos;
+        }
 
         std::string full_text = (path_desc.empty() || route) ? text : (text + "  [" + path_desc + "]");
         ChatMessage msg{
             now_hms_str(), sender, true, rssi, snr, hops, full_text, false, is_mention, false
         };
+        if (mono_img) {
+            msg.has_mono_image = true;
+            msg.mono_image = *mono_img;
+        }
         msg.trace_key = dedup_key;
         if (route) msg.routes.push_back(*route);
 
@@ -3120,13 +3180,115 @@ public:
         }
     }
 
+    void attach_image_from_path(const std::wstring& path_w) {
+        if (path_w.empty()) return;
+        std::string fname = from_wide(std::filesystem::path(path_w).filename().wstring());
+        if (fname.empty()) fname = "image";
+        // Run the conversion pipeline asynchronously on a background worker thread
+        std::thread([this, path_w, fname]() {
+#ifdef _WIN32
+            HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+#endif
+            std::array<uint8_t, MONO_IMG_BYTES> bits{};
+            std::string err;
+            bool ok = load_and_encode_image_file(path_w, bits, err);
+#ifdef _WIN32
+            if (SUCCEEDED(hr)) CoUninitialize();
+#endif
+            std::lock_guard<std::mutex> lk(pending_image_mtx);
+            async_img_ok = ok;
+            async_img_bits = bits;
+            async_img_error = err;
+            async_img_filename = fname;
+            async_img_done = true;
+        }).detach();
+    }
+
+    void attach_image_from_picker(HWND hwnd) {
+        std::wstring picked = open_image_file_dialog(hwnd);
+        if (picked.empty()) return;
+        std::string fname = from_wide(std::filesystem::path(picked).filename().wstring());
+        if (fname.empty()) fname = "image";
+
+        std::array<uint8_t, MONO_IMG_BYTES> bits{};
+        std::string err;
+        if (load_and_encode_image_file(picked, bits, err)) {
+            pending_image_bits = bits;
+            pending_image_name = fname;
+            pending_image_ready = true;
+            log_console("[IMAGE ENCODER] Dithered '" + pending_image_name +
+                        "' -> 48x30 1-bit Floyd-Steinberg (180B payload / 181B opcode 0x49). Auto-transmitting...");
+            confirm_send_pending_image();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        } else {
+            log_active_tab("[IMAGE ENCODER ERROR] " + err);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+    }
+
+    void confirm_send_pending_image() {
+        if (!pending_image_ready) return;
+        std::array<uint8_t, MONO_IMG_BYTES> bits = pending_image_bits;
+        std::string img_name = pending_image_name;
+        pending_image_ready = false;
+        pending_image_name.clear();
+
+        // Normalize through the single-packet 0x49 wire codec so sender & receiver bitmaps and dedup keys match 100%
+        std::string wire = encode_mono_img_companion_wire(bits);
+        std::array<uint8_t, MONO_IMG_BYTES> wire_bits = bits;
+        decode_mono_img_companion_wire(reinterpret_cast<const uint8_t*>(wire.data()), wire.size(), wire_bits);
+
+        center_view = CenterView::Chat;
+        if (active_tab_idx == 0 || (active_tab_idx < tabs.size() && !tabs[active_tab_idx].name.empty() && tabs[active_tab_idx].name[0] == '@')) {
+            select_tab(1); // Switch to Public channel tab if on *Console* or @DM tab
+        }
+
+        std::string ch = tabs[active_tab_idx].name;
+        std::array<uint8_t, 16> psk{};
+        std::string evicted;
+        uint8_t slot_idx = hw_slots.allocate_or_touch(ch, psk, evicted);
+
+        if (ch != PUBLIC_CHANNEL_NAME) {
+            transport.sync_channel_slot(slot_idx, ch, psk);
+        }
+        transport.send_channel_mono_image(slot_idx, ch, callsign, wire_bits);
+
+        std::string dedup_payload = hex_string(wire_bits.data(), 24, "");
+        std::string dedup_key = normalize_channel_name(ch) + "|" + callsign + "|" + dedup_payload;
+        recent_dedup.push_back({dedup_key, now_epoch_secs()});
+
+        std::string label = "[1-Bit Tactical Bitmap 48x30 (180B / Opcode 0x49) — " +
+                            (img_name.empty() ? std::string("bitmap") : img_name) + "]";
+        ChatMessage msg{
+            now_hms_str(), callsign, false, 0, 0.0f, 0, label, false, false, true
+        };
+        msg.has_mono_image = true;
+        msg.mono_image = wire_bits;
+        msg.trace_key = dedup_key;
+        tabs[active_tab_idx].messages.push_back(std::move(msg));
+        tabs[active_tab_idx].scroll_offset = 0;
+        log_console("[TX 0x49 MONO_IMG] Transmitted '" + (img_name.empty() ? std::string("bitmap") : img_name) +
+                    "' to " + ch + " (Slot " + std::to_string(slot_idx) + ")");
+        state_dirty = true;
+    }
+
+    void cancel_pending_image() {
+        pending_image_ready = false;
+        pending_image_name.clear();
+    }
+
     void submit_chat_input() {
         std::string line = trim_str(chat_input);
         chat_input.clear();
         chat_cursor = 0;
         history_idx = -1;
         replying_to_user.clear();
-        if (line.empty()) return;
+        if (line.empty()) {
+            if (pending_image_ready) {
+                confirm_send_pending_image();
+            }
+            return;
+        }
 
         cmd_history.push_back(line);
         if (line[0] == '/') {
@@ -3386,6 +3548,12 @@ public:
             toggle_session_recording(rest);
         } else if (cmd == "/replay") {
             replay_session_file(rest);
+        } else if (cmd == "/image" || cmd == "/img" || cmd == "/bitmap") {
+            if (rest.empty()) {
+                attach_image_from_picker(nullptr);
+            } else {
+                attach_image_from_path(to_wide(rest));
+            }
         } else if (cmd == "/export") {
             std::string what = rest;
             std::transform(what.begin(), what.end(), what.begin(),
@@ -3397,7 +3565,7 @@ public:
             else if (what == "all" || what.empty()) export_all();
             else log_active_tab("Usage: /export [nodes|kml|packets|adverts|all]");
         } else if (cmd == "/help") {
-            log_active_tab("Commands: /join #tag, /dm <node> [msg], /advert [flood|direct], /tracepath <node>, /part, /serial [COMx], /ble, /sim, /nick <CALL>, /addword #tag, /slots, /list, /clear, /save");
+            log_active_tab("Commands: /join #tag, /image [file], /dm <node> [msg], /advert [flood|direct], /tracepath <node>, /part, /serial [COMx], /ble, /sim, /nick <CALL>, /addword #tag, /slots, /list, /clear, /save");
             log_active_tab("Repeater Admin & Capture: /rlogin [rpt] <pass>, /rcmd [rpt] <ver|neighbors|clock|stats|reboot>, /cli <cmd>, /rstatus [rpt], /rtelemetry [rpt], /resetpath [node], /record [on|off], /replay [file]");
             log_active_tab("Snooping: /packets (hex inspector), /adverts (advert log), /paths (relay path tracer), /map, /chat, /export [nodes|kml|packets|adverts|all]");
         } else {
@@ -3470,7 +3638,10 @@ enum ButtonId {
     BTN_PKT_RECORD = 65,
     BTN_PKT_REPLAY = 66,
     BTN_TOGGLE_THEME = 67,
-    BTN_RESET_LAYOUT = 68
+    BTN_RESET_LAYOUT = 68,
+    BTN_ATTACH_IMAGE = 69,
+    BTN_CONFIRM_SEND_IMAGE = 70,
+    BTN_CANCEL_SEND_IMAGE = 71
 };
 
 class D2DRenderer {
@@ -3725,6 +3896,99 @@ public:
             rt->DrawText(w.c_str(), static_cast<UINT32>(w.size()), fmt, r, b,
                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
             b->Release();
+        }
+    }
+
+    // Unpacks a 180-byte 1-bit bitmap into a stack-allocated 1,440-pixel (48x30) buffer and renders it
+    // at pixel_scale (e.g. 5x -> 240x150 screen pixels) using strictly Nearest-Neighbor interpolation.
+    void draw_mono_bitmap_nearest(const std::array<uint8_t, MONO_IMG_BYTES>& bits,
+                                  float x,
+                                  float y,
+                                  float pixel_scale = 5.0f) {
+        if (!rt) return;
+        uint8_t pixels[MONO_IMG_PIXELS]; // 1,440 bytes stack-allocated
+        unpack_mono_bitmap(bits, pixels);
+
+        float cw = static_cast<float>(MONO_IMG_W) * pixel_scale;
+        float ch = static_cast<float>(MONO_IMG_H) * pixel_scale;
+        D2D1_RECT_F frame_r = D2D1::RectF(x - 2.0f, y - 2.0f, x + cw + 2.0f, y + ch + 2.0f);
+        D2D1_RECT_F canvas_r = D2D1::RectF(x, y, x + cw, y + ch);
+        D2D1_RECT_F src_r = D2D1::RectF(0.0f, 0.0f, static_cast<float>(MONO_IMG_W), static_cast<float>(MONO_IMG_H));
+
+        fill_round_rect(frame_r, 4.0f, D2D1::ColorF(0.02f, 0.03f, 0.06f, 1.0f));
+        draw_round_rect(frame_r, 4.0f, hex_color(0x00E5FF, 0.75f), 1.2f);
+
+        bool drawn = false;
+#ifdef _WIN32
+        // Stack-allocated 48x30 BGRA texture (5,760 bytes on stack)
+        uint32_t bgra[MONO_IMG_PIXELS];
+        for (size_t i = 0; i < MONO_IMG_PIXELS; ++i) {
+            bgra[i] = pixels[i] ? 0xFFF8FAFCu : 0xFF05080Fu;
+        }
+        ID2D1Bitmap* bmp = nullptr;
+        D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
+        if (SUCCEEDED(rt->CreateBitmap(D2D1::SizeU(MONO_IMG_W, MONO_IMG_H), bgra, MONO_IMG_W * 4, &props, &bmp)) && bmp) {
+            rt->DrawBitmap(bmp, canvas_r, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src_r);
+            bmp->Release();
+            drawn = true;
+        }
+#elif defined(__APPLE__)
+        // Stack-allocated 48x30 RGBA texture (5,760 bytes on stack) rendered with kCGInterpolationNone
+        uint8_t rgba[MONO_IMG_PIXELS * 4];
+        for (size_t i = 0; i < MONO_IMG_PIXELS; ++i) {
+            if (pixels[i]) {
+                rgba[i * 4 + 0] = 0xF8;
+                rgba[i * 4 + 1] = 0xFA;
+                rgba[i * 4 + 2] = 0xFC;
+                rgba[i * 4 + 3] = 0xFF;
+            } else {
+                rgba[i * 4 + 0] = 0x05;
+                rgba[i * 4 + 1] = 0x08;
+                rgba[i * 4 + 2] = 0x0F;
+                rgba[i * 4 + 3] = 0xFF;
+            }
+        }
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        if (cs) {
+            CGContextRef bctx = CGBitmapContextCreate(rgba, MONO_IMG_W, MONO_IMG_H, 8, MONO_IMG_W * 4, cs,
+                                                      1u | (3u << 12)); // kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big
+            if (bctx) {
+                CGImageRef cg_img = CGBitmapContextCreateImage(bctx);
+                if (cg_img) {
+                    ID2D1Bitmap bmp(cg_img);
+                    rt->DrawBitmap(&bmp, canvas_r, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src_r);
+                    drawn = true;
+                }
+                CGContextRelease(bctx);
+            }
+            CGColorSpaceRelease(cs);
+        }
+#endif
+        if (!drawn) {
+            // Exact integer-aligned Nearest-Neighbor block fallback
+            ID2D1SolidColorBrush* bg_b = nullptr;
+            ID2D1SolidColorBrush* fg_b = nullptr;
+            rt->CreateSolidColorBrush(D2D1::ColorF(0.02f, 0.03f, 0.06f, 1.0f), &bg_b);
+            rt->CreateSolidColorBrush(D2D1::ColorF(0.97f, 0.98f, 0.99f, 1.0f), &fg_b);
+            if (bg_b && fg_b) {
+                rt->FillRectangle(canvas_r, bg_b);
+                for (size_t py = 0; py < MONO_IMG_H; ++py) {
+                    float ry0 = y + static_cast<float>(py) * pixel_scale;
+                    float ry1 = ry0 + pixel_scale;
+                    size_t px = 0;
+                    while (px < MONO_IMG_W) {
+                        if (!pixels[py * MONO_IMG_W + px]) { ++px; continue; }
+                        size_t run_end = px + 1;
+                        while (run_end < MONO_IMG_W && pixels[py * MONO_IMG_W + run_end]) ++run_end;
+                        rt->FillRectangle(D2D1::RectF(x + static_cast<float>(px) * pixel_scale, ry0,
+                                                      x + static_cast<float>(run_end) * pixel_scale, ry1), fg_b);
+                        px = run_end;
+                    }
+                }
+            }
+            if (bg_b) bg_b->Release();
+            if (fg_b) fg_b->Release();
         }
     }
 
@@ -4491,7 +4755,8 @@ private:
         };
         auto msg_height = [&](const ChatMessage& m) -> float {
             float hgt = 28.0f;
-            if (!m.is_system && !extract_hashtags(m.text).empty()) hgt += 24.0f;
+            if (!m.is_system && m.has_mono_image) hgt += 160.0f; // 150px (48x30 @ 5x Nearest-Neighbor) + 10px margin
+            if (!m.is_system && !m.has_mono_image && !extract_hashtags(m.text).empty()) hgt += 24.0f;
             hgt += static_cast<float>(route_line_count(m)) * 16.0f;
             return hgt;
         };
@@ -4504,7 +4769,7 @@ private:
         float used_h = 0.0f;
         while (start_idx > 0) {
             float hgt = msg_height(active_tab.messages[start_idx - 1]);
-            if (used_h + hgt > avail_h) break;
+            if (used_h + hgt > avail_h && start_idx < end_idx) break;
             used_h += hgt;
             --start_idx;
         }
@@ -4512,9 +4777,9 @@ private:
         float my = chat_box.top + 6.0f;
         for (int i = start_idx; i < end_idx; ++i) {
             const auto& msg = active_tab.messages[i];
-            auto tags_in_msg = msg.is_system ? std::vector<std::string>{} : extract_hashtags(msg.text);
+            auto tags_in_msg = (msg.is_system || msg.has_mono_image) ? std::vector<std::string>{} : extract_hashtags(msg.text);
             float item_h = msg_height(msg);
-            if (my + item_h > chat_box.bottom - 4.0f) break;
+            if (my + item_h > chat_box.bottom - 4.0f && i > start_idx) break;
 
             D2D1_RECT_F card_r = D2D1::RectF(chat_box.left + 8, my, chat_box.right - 8, my + item_h - 2.0f);
             D2D1_RECT_F line_r = D2D1::RectF(chat_box.left + 8, my, chat_box.right - 8, my + 26.0f);
@@ -4578,10 +4843,36 @@ private:
                           D2D1::RectF(cur_x, line_r.top, line_r.right - 8, line_r.bottom),
                           msg.is_mention ? hex_color(0xFCA5A5) : hex_color(0xF1F5F9));
 
+                float sub_y = line_r.bottom;
+
+                // Inline 1-Bit Monochrome Bitmap Canvas (48x30 scaled 5x -> 240x150 Nearest-Neighbor)
+                if (msg.has_mono_image) {
+                    float img_x = line_r.left + 82.0f;
+                    float img_y = sub_y + 4.0f;
+                    draw_mono_bitmap_nearest(msg.mono_image, img_x, img_y, 5.0f);
+
+                    D2D1_RECT_F badge_r = D2D1::RectF(img_x + 252.0f, img_y + 2.0f,
+                                                      std::min(line_r.right - 8.0f, img_x + 478.0f), img_y + 68.0f);
+                    if (badge_r.right > badge_r.left + 70.0f) {
+                        fill_round_rect(badge_r, 5.0f, hex_color(0x111A2B, 0.85f));
+                        draw_round_rect(badge_r, 5.0f, hex_color(0x00E5FF, 0.45f), 1.0f);
+                        draw_text("0x49 MONO_IMG • 48x30 (1-Bit)", font_mono_small,
+                                  D2D1::RectF(badge_r.left + 8, badge_r.top + 4, badge_r.right - 6, badge_r.top + 24),
+                                  hex_color(0x00E5FF));
+                        draw_text("180B Packed • 181B Single-Pkt", font_mono_small,
+                                  D2D1::RectF(badge_r.left + 8, badge_r.top + 24, badge_r.right - 6, badge_r.top + 44),
+                                  hex_color(0x10B981));
+                        draw_text("5x Nearest-Neighbor (240x150)", font_mono_small,
+                                  D2D1::RectF(badge_r.left + 8, badge_r.top + 44, badge_r.right - 6, badge_r.top + 64),
+                                  hex_color(0x94A3B8));
+                    }
+                    sub_y += 160.0f;
+                }
+
                 // Clickable #hashtag pills on dedicated action sub-row below the message text
                 if (!tags_in_msg.empty()) {
                     float pill_x = line_r.left + 82.0f;
-                    float pill_top = line_r.bottom + 1.0f;
+                    float pill_top = sub_y + 1.0f;
                     float pill_bot = pill_top + 22.0f;
                     draw_text("DISCOVERED CHANNELS:", font_mono_small,
                               D2D1::RectF(pill_x, pill_top, pill_x + 132.0f, pill_bot),
@@ -4600,11 +4891,12 @@ private:
                         app.chat_hashtag_hits.push_back({tag_r, 0, tag});
                         pill_x += bw + 6.0f;
                     }
+                    sub_y += 24.0f;
                 }
 
                 // Repeater trace: one line per distinct over-the-air route this message took
                 if (!msg.routes.empty()) {
-                    float ry = line_r.bottom + (tags_in_msg.empty() ? 0.0f : 24.0f);
+                    float ry = sub_y;
                     float rx0 = line_r.left + 82.0f;
                     size_t shown = std::min(msg.routes.size(), MAX_ROUTE_LINES);
                     for (size_t ri = 0; ri < shown; ++ri) {
@@ -4695,8 +4987,8 @@ private:
                       hex_color(0x64748B), DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
 
-        // 5. Bottom Message Composer Input Box + [Transmit TX] Button
-        D2D1_RECT_F input_r = D2D1::RectF(x + 10, y + h - 46, x + w - 134, y + h - 10);
+        // 5. Bottom Message Composer Input Box + [📎 IMG] Attach Button + [Transmit TX] Button
+        D2D1_RECT_F input_r = D2D1::RectF(x + 10, y + h - 46, x + w - 208, y + h - 10);
         bool chat_focused = (app.active_input == ActiveInputTarget::ChatComposer);
         bool has_reply = !app.replying_to_user.empty();
         fill_round_rect(input_r, 7.0f, hex_color(0x090D16));
@@ -4720,12 +5012,25 @@ private:
 
         std::string prompt = "[" + app.callsign + " @ " + active_tab.name + "] > ";
         std::string disp_input = app.chat_input.empty() && !chat_focused
-                                     ? (prompt + "Type message or double-click any user to reply...")
+                                     ? (prompt + "Type message or attach 1-bit image (📎)...")
                                      : (prompt + app.chat_input + (chat_focused ? "_" : ""));
         draw_text(disp_input, font_mono,
                   D2D1::RectF(input_r.left + 12, input_r.top, text_right, input_r.bottom),
                   app.chat_input.empty() && !chat_focused ? hex_color(0x64748B) : hex_color(0xF8FAFC));
         app.button_hits.push_back({D2D1::RectF(input_r.left, input_r.top, text_right, input_r.bottom), BTN_CHAT_INPUT_BOX, ""});
+
+        // [📎 IMG] Attach Image button next to the channel text input box
+        D2D1_RECT_F attach_btn = D2D1::RectF(x + w - 202, y + h - 46, x + w - 132, y + h - 10);
+        bool att_hov = pt_in_rect(app.mouse_pt, attach_btn);
+        fill_round_rect(attach_btn, 7.0f, app.pending_image_ready ? hex_color(0x10B981, 0.28f)
+                                        : att_hov                 ? hex_color(0x1E293B)
+                                                                  : hex_color(0x131C2E));
+        draw_round_rect(attach_btn, 7.0f, app.pending_image_ready ? hex_color(0x10B981)
+                                        : att_hov                 ? hex_color(0x00E5FF)
+                                                                  : hex_color(0x334155), 1.4f);
+        draw_text("\xF0\x9F\x93\x8E IMG", font_ui_bold, attach_btn,
+                  app.pending_image_ready ? hex_color(0x10B981) : hex_color(0x38BDF8), DWRITE_TEXT_ALIGNMENT_CENTER);
+        app.button_hits.push_back({attach_btn, BTN_ATTACH_IMAGE, ""});
 
         D2D1_RECT_F tx_btn = D2D1::RectF(x + w - 126, y + h - 46, x + w - 10, y + h - 10);
         bool tx_hov = pt_in_rect(app.mouse_pt, tx_btn);
@@ -4733,6 +5038,49 @@ private:
         draw_round_rect(tx_btn, 7.0f, hex_color(0x00E5FF), 1.5f);
         draw_text("TRANSMIT TX", font_ui_bold, tx_btn, hex_color(0x00E5FF), DWRITE_TEXT_ALIGNMENT_CENTER);
         app.button_hits.push_back({tx_btn, BTN_TRANSMIT_TX, ""});
+
+        // 6. Pending 48x30 Dithered Thumbnail Preview Modal/Badge (when an image is staged for transmission)
+        if (app.pending_image_ready) {
+            float mw = std::min(w - 28.0f, 515.0f);
+            float mh = 114.0f;
+            float mx = std::max(x + 14.0f, x + w - mw - 14.0f);
+            float my_modal = y + h - 82.0f - mh;
+            D2D1_RECT_F modal_r = D2D1::RectF(mx, my_modal, mx + mw, my_modal + mh);
+
+            fill_round_rect(modal_r, 8.0f, hex_color(0x0B111E, 0.97f));
+            draw_round_rect(modal_r, 8.0f, hex_color(0x00E5FF), 1.6f);
+
+            // Render 48x30 dithered thumbnail at 3x Nearest-Neighbor scale (144x90)
+            draw_mono_bitmap_nearest(app.pending_image_bits, mx + 12.0f, my_modal + 12.0f, 3.0f);
+
+            float info_x = mx + 168.0f;
+            std::string target_ch = (app.active_tab_idx == 0 || (!active_tab.name.empty() && active_tab.name[0] == '@'))
+                                        ? std::string(PUBLIC_CHANNEL_NAME)
+                                        : active_tab.name;
+            draw_text("READY: 48x30 1-BIT TACTICAL BITMAP (" + app.pending_image_name + ")", font_ui_bold,
+                      D2D1::RectF(info_x, my_modal + 10.0f, modal_r.right - 10.0f, my_modal + 32.0f),
+                      hex_color(0x00E5FF));
+            draw_text("Floyd-Steinberg Dithered • 180B Packed • 181B Single-Packet (Opcode 0x49) -> " + target_ch,
+                      font_mono_small,
+                      D2D1::RectF(info_x, my_modal + 34.0f, modal_r.right - 10.0f, my_modal + 54.0f),
+                      hex_color(0x94A3B8));
+
+            D2D1_RECT_F send_img_btn = D2D1::RectF(info_x, my_modal + 64.0f, info_x + 188.0f, my_modal + 100.0f);
+            bool shov = pt_in_rect(app.mouse_pt, send_img_btn);
+            fill_round_rect(send_img_btn, 6.0f, shov ? hex_color(0x10B981, 0.36f) : hex_color(0x10B981, 0.22f));
+            draw_round_rect(send_img_btn, 6.0f, hex_color(0x10B981), 1.5f);
+            draw_text("SEND 181B IMAGE", font_ui_bold, send_img_btn, hex_color(0x10B981), DWRITE_TEXT_ALIGNMENT_CENTER);
+            app.button_hits.push_back({send_img_btn, BTN_CONFIRM_SEND_IMAGE, ""});
+
+            D2D1_RECT_F cancel_img_btn = D2D1::RectF(info_x + 196.0f, my_modal + 64.0f,
+                                                     std::min(modal_r.right - 10.0f, info_x + 306.0f), my_modal + 100.0f);
+            bool chov_c = pt_in_rect(app.mouse_pt, cancel_img_btn);
+            fill_round_rect(cancel_img_btn, 6.0f, chov_c ? hex_color(0xEF4444, 0.28f) : hex_color(0x1E293B));
+            draw_round_rect(cancel_img_btn, 6.0f, chov_c ? hex_color(0xEF4444) : hex_color(0x475569), 1.2f);
+            draw_text("CANCEL [X]", font_small, cancel_img_btn,
+                      chov_c ? hex_color(0xFCA5A5) : hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
+            app.button_hits.push_back({cancel_img_btn, BTN_CANCEL_SEND_IMAGE, ""});
+        }
     }
 
     // ========================================================================
@@ -6012,6 +6360,15 @@ static void handle_left_click(HWND hwnd, POINT pt) {
                 case BTN_PKT_REPLAY:
                     g_app->replay_session_file();
                     break;
+                case BTN_ATTACH_IMAGE:
+                    g_app->attach_image_from_picker(hwnd);
+                    break;
+                case BTN_CONFIRM_SEND_IMAGE:
+                    g_app->confirm_send_pending_image();
+                    break;
+                case BTN_CANCEL_SEND_IMAGE:
+                    g_app->cancel_pending_image();
+                    break;
             }
             return;
         }
@@ -6332,7 +6689,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     tab.scroll_offset = std::max(0, tab.scroll_offset - 8);
                 } else if (wParam == VK_ESCAPE) {
                     g_app->serial_dropdown_open = false;
-                    if (g_app->active_input == ActiveInputTarget::SnifferFilter) {
+                    if (g_app->pending_image_ready) {
+                        g_app->cancel_pending_image();
+                    } else if (g_app->active_input == ActiveInputTarget::SnifferFilter) {
                         g_app->sniffer_filter.clear();
                     } else if (!g_app->replying_to_user.empty()) {
                         g_app->clear_reply_target();

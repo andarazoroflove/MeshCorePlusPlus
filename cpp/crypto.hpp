@@ -358,6 +358,296 @@ inline std::optional<std::vector<uint8_t>> decrypt_aes128_blocks(
     return out;
 }
 
+#ifndef MESHCORE_MONO_IMG_CONSTANTS
+#define MESHCORE_MONO_IMG_CONSTANTS
+constexpr uint8_t PAYLOAD_TYPE_MONO_IMG = 0x49; // 'I'
+constexpr size_t MONO_IMG_W             = 48;
+constexpr size_t MONO_IMG_H             = 30;
+constexpr size_t MONO_IMG_PIXELS        = MONO_IMG_W * MONO_IMG_H; // 1,440 pixels
+constexpr size_t MONO_IMG_BYTES         = MONO_IMG_PIXELS / 8;     // 180 bytes
+constexpr size_t MONO_IMG_RF_BYTES      = 1 + MONO_IMG_BYTES;      // 181 bytes (Byte 0 = 0x49 + 180B bitmap)
+constexpr size_t MONO_IMG_WIRE_PAIRS    = 60;                      // 60 Base91 pairs = 120 ASCII chars = 780 bits
+constexpr size_t MONO_IMG_WIRE_BITS     = MONO_IMG_WIRE_PAIRS * 13; // 780 bits
+constexpr size_t MONO_IMG_WIRE_LEN      = 2 + MONO_IMG_WIRE_PAIRS * 2; // 122 bytes: [0x49 ('I'), '!', 120 Base91 chars]
+#endif
+
+// ============================================================================
+// Single-Packet Companion-Safe 0x49 ('I!') Wire Codec (122 ASCII bytes, 0 nulls)
+// Fits cleanly inside stock MeshCore v1.17+ CMD_SEND_CHANNEL_TXT_MSG single-packet
+// LoRa MTU alongside any node callsign, while preserving 48x30 1-bit dithering.
+// ============================================================================
+inline char mono_b91_encode_char(uint32_t idx) noexcept {
+    // 91 printable ASCII chars in 0x21..0x7E excluding '"'(0x22), '\''(0x27), '\\'(0x5C)
+    static constexpr char TABLE[92] =
+        "!#$%&()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    return TABLE[idx % 91u];
+}
+
+inline int mono_b91_decode_char(uint8_t c) noexcept {
+    if (c < 0x21 || c > 0x7E || c == '"' || c == '\'' || c == '\\') return -1;
+    int v = static_cast<int>(c) - 0x21;
+    if (c > '"')  --v;
+    if (c > '\'') --v;
+    if (c > '\\') --v;
+    return (v >= 0 && v < 91) ? v : -1;
+}
+
+inline bool try_encode_mono_rle_bits(const uint8_t px[MONO_IMG_PIXELS],
+                                     bool row_xor,
+                                     uint8_t out_bitbuf[MONO_IMG_WIRE_BITS]) noexcept {
+    uint8_t work[MONO_IMG_PIXELS];
+    if (row_xor) {
+        std::memcpy(work, px, MONO_IMG_W);
+        for (size_t y = 1; y < MONO_IMG_H; ++y) {
+            for (size_t x = 0; x < MONO_IMG_W; ++x) {
+                work[y * MONO_IMG_W + x] = px[y * MONO_IMG_W + x] ^ px[(y - 1) * MONO_IMG_W + x];
+            }
+        }
+    } else {
+        std::memcpy(work, px, MONO_IMG_PIXELS);
+    }
+
+    std::memset(out_bitbuf, 0, MONO_IMG_WIRE_BITS);
+    size_t pos = 0;
+    auto put_bits = [&](uint32_t val, size_t nbits) -> bool {
+        if (pos + nbits > MONO_IMG_WIRE_BITS) return false;
+        for (size_t b = 0; b < nbits; ++b) {
+            out_bitbuf[pos++] = static_cast<uint8_t>((val >> (nbits - 1 - b)) & 1u);
+        }
+        return true;
+    };
+
+    // Header: mode=0 (1b), row_xor (1b), first_pixel (1b)
+    if (!put_bits(0u, 1) || !put_bits(row_xor ? 1u : 0u, 1) || !put_bits(work[0] ? 1u : 0u, 1)) {
+        return false;
+    }
+
+    size_t i = 0;
+    while (i < MONO_IMG_PIXELS) {
+        uint8_t cur = work[i];
+        size_t run = 1;
+        while (i + run < MONO_IMG_PIXELS && work[i + run] == cur) {
+            ++run;
+        }
+        i += run;
+        if (run == 1) {
+            if (!put_bits(0b00u, 2)) return false;
+        } else if (run == 2) {
+            if (!put_bits(0b01u, 2)) return false;
+        } else if (run <= 6) {
+            if (!put_bits(0b10u, 2) || !put_bits(static_cast<uint32_t>(run - 3), 2)) return false;
+        } else if (run <= 22) {
+            if (!put_bits(0b110u, 3) || !put_bits(static_cast<uint32_t>(run - 7), 4)) return false;
+        } else {
+            if (!put_bits(0b111u, 3) || !put_bits(static_cast<uint32_t>(run), 11)) return false;
+        }
+    }
+    return true;
+}
+
+inline std::string encode_mono_img_companion_wire(const std::array<uint8_t, MONO_IMG_BYTES>& bits) noexcept {
+    uint8_t px[MONO_IMG_PIXELS];
+    for (size_t i = 0; i < MONO_IMG_PIXELS; ++i) {
+        px[i] = static_cast<uint8_t>((bits[i >> 3] >> (7u - (i & 7u))) & 1u);
+    }
+
+    uint8_t bitbuf[MONO_IMG_WIRE_BITS]{};
+    bool rle_ok = try_encode_mono_rle_bits(px, false, bitbuf);
+    if (!rle_ok) {
+        rle_ok = try_encode_mono_rle_bits(px, true, bitbuf);
+    }
+
+    if (!rle_ok) {
+        // Mode 1: 48x30 (24x15 2x2 blocks) Complete Prefix-Free Density + Sub-Block Orientation Codec
+        std::memset(bitbuf, 0, sizeof(bitbuf));
+        size_t pos = 0;
+        auto put_bits = [&](uint32_t val, size_t nbits) noexcept {
+            for (size_t b = 0; b < nbits && pos < MONO_IMG_WIRE_BITS; ++b) {
+                bitbuf[pos++] = static_cast<uint8_t>((val >> (nbits - 1 - b)) & 1u);
+            }
+        };
+
+        put_bits(1u, 1); // Mode 1
+
+        uint8_t blk_density[360]{};
+        uint8_t blk_pat[360]{};
+        for (size_t by = 0; by < 15; ++by) {
+            for (size_t bx = 0; bx < 24; ++bx) {
+                size_t bidx = by * 24 + bx;
+                uint8_t tl = px[(by * 2) * MONO_IMG_W + (bx * 2)];
+                uint8_t tr = px[(by * 2) * MONO_IMG_W + (bx * 2 + 1)];
+                uint8_t bl = px[(by * 2 + 1) * MONO_IMG_W + (bx * 2)];
+                uint8_t br = px[(by * 2 + 1) * MONO_IMG_W + (bx * 2 + 1)];
+                uint8_t sum = static_cast<uint8_t>(tl + tr + bl + br);
+                blk_pat[bidx] = static_cast<uint8_t>((tl << 3) | (tr << 2) | (bl << 1) | br);
+
+                size_t rem_after = 359 - bidx;
+                bool can_3bit = (pos + 3 + rem_after * 2 <= MONO_IMG_WIRE_BITS);
+                if ((sum == 1 || sum == 3) && !can_3bit) {
+                    bool phase = ((bx + by) & 1u) != 0;
+                    sum = (sum == 1) ? (phase ? 2 : 0) : (phase ? 4 : 2);
+                }
+                blk_density[bidx] = sum;
+
+                if (sum == 0)      put_bits(0b00u, 2);
+                else if (sum == 4) put_bits(0b01u, 2);
+                else if (sum == 2) put_bits(0b10u, 2);
+                else if (sum == 1) put_bits(0b110u, 3);
+                else               put_bits(0b111u, 3);
+            }
+        }
+
+        // Sub-block 2x2 orientation refinement using remaining bits up to 780
+        for (size_t bidx = 0; bidx < 360 && pos + 2 <= MONO_IMG_WIRE_BITS; ++bidx) {
+            uint8_t d = blk_density[bidx];
+            uint8_t pat = blk_pat[bidx];
+            if (d == 2) {
+                // 00 = diagonal dither, 01 = top edge (1100), 10 = bottom edge (0011), 11 = vertical edge (1010/0101)
+                uint32_t code = 0;
+                if (pat == 0b1100) code = 1;
+                else if (pat == 0b0011) code = 2;
+                else if (pat == 0b1010 || pat == 0b0101) code = 3;
+                put_bits(code, 2);
+            } else if (d == 1) {
+                uint32_t p = (pat & 0b1000) ? 0u : (pat & 0b0100) ? 1u : (pat & 0b0010) ? 2u : 3u;
+                put_bits(p, 2);
+            } else if (d == 3) {
+                uint32_t z = !(pat & 0b1000) ? 0u : !(pat & 0b0100) ? 1u : !(pat & 0b0010) ? 2u : 3u;
+                put_bits(z, 2);
+            }
+        }
+    }
+
+    std::string out;
+    out.resize(MONO_IMG_WIRE_LEN);
+    out[0] = static_cast<char>(PAYLOAD_TYPE_MONO_IMG); // 'I' (0x49)
+    out[1] = '!';
+    for (size_t p = 0; p < MONO_IMG_WIRE_PAIRS; ++p) {
+        uint32_t val = 0;
+        for (size_t b = 0; b < 13; ++b) {
+            val = (val << 1) | (bitbuf[p * 13 + b] & 1u);
+        }
+        out[2 + p * 2]     = mono_b91_encode_char(val % 91u);
+        out[2 + p * 2 + 1] = mono_b91_encode_char(val / 91u);
+    }
+    return out;
+}
+
+inline bool decode_mono_img_companion_wire(const uint8_t* data,
+                                           size_t len,
+                                           std::array<uint8_t, MONO_IMG_BYTES>& out_bits) noexcept {
+    if (!data || len < MONO_IMG_WIRE_LEN) return false;
+    if (data[0] != PAYLOAD_TYPE_MONO_IMG || data[1] != '!') return false;
+
+    uint8_t bitbuf[MONO_IMG_WIRE_BITS]{};
+    for (size_t p = 0; p < MONO_IMG_WIRE_PAIRS; ++p) {
+        int d0 = mono_b91_decode_char(data[2 + p * 2]);
+        int d1 = mono_b91_decode_char(data[2 + p * 2 + 1]);
+        if (d0 < 0 || d1 < 0) return false;
+        uint32_t val = static_cast<uint32_t>(d0 + d1 * 91);
+        if (val >= 8192u) return false;
+        for (size_t b = 0; b < 13; ++b) {
+            bitbuf[p * 13 + b] = static_cast<uint8_t>((val >> (12 - b)) & 1u);
+        }
+    }
+
+    uint8_t px[MONO_IMG_PIXELS]{};
+    size_t pos = 0;
+    auto get_bits = [&](size_t nbits) noexcept -> uint32_t {
+        uint32_t v = 0;
+        for (size_t b = 0; b < nbits; ++b) {
+            v = (v << 1) | ((pos < MONO_IMG_WIRE_BITS) ? (bitbuf[pos++] & 1u) : 0u);
+        }
+        return v;
+    };
+
+    uint32_t mode = get_bits(1);
+    if (mode == 0) {
+        bool row_xor = (get_bits(1) != 0);
+        uint8_t cur = static_cast<uint8_t>(get_bits(1));
+        size_t idx = 0;
+        while (idx < MONO_IMG_PIXELS && pos < MONO_IMG_WIRE_BITS) {
+            uint32_t b0 = get_bits(1);
+            size_t run = 1;
+            if (b0 == 0) {
+                run = (get_bits(1) == 0) ? 1 : 2;
+            } else {
+                uint32_t b1 = get_bits(1);
+                if (b1 == 0) {
+                    run = 3 + get_bits(2);
+                } else if (get_bits(1) == 0) {
+                    run = 7 + get_bits(4);
+                } else {
+                    run = get_bits(11);
+                    if (run == 0) break;
+                }
+            }
+            size_t end = std::min<size_t>(MONO_IMG_PIXELS, idx + run);
+            for (; idx < end; ++idx) px[idx] = cur;
+            cur ^= 1u;
+        }
+        if (row_xor) {
+            for (size_t y = 1; y < MONO_IMG_H; ++y) {
+                for (size_t x = 0; x < MONO_IMG_W; ++x) {
+                    px[y * MONO_IMG_W + x] ^= px[(y - 1) * MONO_IMG_W + x];
+                }
+            }
+        }
+    } else {
+        uint8_t blk_density[360]{};
+        for (size_t bidx = 0; bidx < 360; ++bidx) {
+            uint32_t b0 = get_bits(1);
+            uint32_t b1 = get_bits(1);
+            if (b0 == 0 && b1 == 0)      blk_density[bidx] = 0;
+            else if (b0 == 0 && b1 == 1) blk_density[bidx] = 4;
+            else if (b0 == 1 && b1 == 0) blk_density[bidx] = 2;
+            else                         blk_density[bidx] = (get_bits(1) == 0) ? 1 : 3;
+        }
+
+        for (size_t by = 0; by < 15; ++by) {
+            for (size_t bx = 0; bx < 24; ++bx) {
+                size_t bidx = by * 24 + bx;
+                uint8_t d = blk_density[bidx];
+                bool odd = ((bx + by) & 1u) != 0;
+                uint8_t pat = 0;
+                if (d == 0) {
+                    pat = 0b0000;
+                } else if (d == 4) {
+                    pat = 0b1111;
+                } else if (d == 2) {
+                    if (pos + 2 <= MONO_IMG_WIRE_BITS) {
+                        uint32_t c = get_bits(2);
+                        if (c == 0)      pat = odd ? 0b0110 : 0b1001;
+                        else if (c == 1) pat = 0b1100;
+                        else if (c == 2) pat = 0b0011;
+                        else             pat = odd ? 0b0101 : 0b1010;
+                    } else {
+                        pat = odd ? 0b0110 : 0b1001;
+                    }
+                } else if (d == 1) {
+                    uint32_t p = (pos + 2 <= MONO_IMG_WIRE_BITS) ? get_bits(2) : (odd ? 3u : 0u);
+                    pat = static_cast<uint8_t>(1u << (3u - p));
+                } else {
+                    uint32_t z = (pos + 2 <= MONO_IMG_WIRE_BITS) ? get_bits(2) : (odd ? 2u : 1u);
+                    pat = static_cast<uint8_t>(0b1111u ^ (1u << (3u - z)));
+                }
+                px[(by * 2) * MONO_IMG_W + (bx * 2)]         = (pat >> 3) & 1u;
+                px[(by * 2) * MONO_IMG_W + (bx * 2 + 1)]     = (pat >> 2) & 1u;
+                px[(by * 2 + 1) * MONO_IMG_W + (bx * 2)]     = (pat >> 1) & 1u;
+                px[(by * 2 + 1) * MONO_IMG_W + (bx * 2 + 1)] = pat & 1u;
+            }
+        }
+    }
+
+    out_bits.fill(0);
+    for (size_t i = 0; i < MONO_IMG_PIXELS; ++i) {
+        if (px[i]) {
+            out_bits[i >> 3] |= static_cast<uint8_t>(1u << (7u - (i & 7u)));
+        }
+    }
+    return true;
+}
+
 inline std::vector<uint8_t> build_meshcore_hw_group_frame(
     const std::string& channel_name,
     const std::string& sender,
@@ -387,6 +677,38 @@ inline std::vector<uint8_t> build_meshcore_hw_group_frame(
     return frame;
 }
 
+inline std::vector<uint8_t> build_meshcore_hw_group_mono_img_frame(
+    const std::string& channel_name,
+    const std::string& sender,
+    const std::array<uint8_t, MONO_IMG_BYTES>& mono_bits,
+    uint32_t timestamp) {
+    auto psk = derive_psk(channel_name);
+    uint8_t hash = compute_channel_hash(psk);
+    std::string prefix = trim_str(sender) + ": ";
+
+    // Plaintext: [timestamp(4B), PAYLOAD_TYPE_MONO_IMG(0x49), "Sender: ", 0x49, 180_bytes_bitmap]
+    std::vector<uint8_t> plain(5 + prefix.size() + MONO_IMG_RF_BYTES);
+    plain[0] = static_cast<uint8_t>(timestamp & 0xFF);
+    plain[1] = static_cast<uint8_t>((timestamp >> 8) & 0xFF);
+    plain[2] = static_cast<uint8_t>((timestamp >> 16) & 0xFF);
+    plain[3] = static_cast<uint8_t>((timestamp >> 24) & 0xFF);
+    plain[4] = PAYLOAD_TYPE_MONO_IMG;
+    std::memcpy(plain.data() + 5, prefix.data(), prefix.size());
+    plain[5 + prefix.size()] = PAYLOAD_TYPE_MONO_IMG;
+    std::memcpy(plain.data() + 5 + prefix.size() + 1, mono_bits.data(), MONO_IMG_BYTES);
+
+    auto ct = encrypt_aes128_blocks(psk, plain.data(), plain.size());
+    auto mac = Sha256::digest(ct.data(), ct.size());
+
+    std::vector<uint8_t> frame;
+    frame.reserve(3 + ct.size());
+    frame.push_back(hash);
+    frame.push_back(mac[0]);
+    frame.push_back(mac[1]);
+    frame.insert(frame.end(), ct.begin(), ct.end());
+    return frame;
+}
+
 struct ChannelCandidate {
     std::string name;
     std::array<uint8_t, 16> psk;
@@ -399,7 +721,9 @@ struct SniffedGroupMessage {
     std::array<uint8_t, 16> psk;
     std::string sender;
     std::string text;
-    uint32_t timestamp;
+    uint32_t timestamp = 0;
+    bool is_mono_img = false;
+    std::array<uint8_t, MONO_IMG_BYTES> mono_img_bytes{};
 };
 
 // Extract #hashtags matching #[a-zA-Z0-9_-]{2,32}
@@ -617,6 +941,34 @@ public:
     }
 
     std::optional<SniffedGroupMessage> sniff_frame(const std::vector<uint8_t>& frame) const {
+        // Direct raw 181-byte [0x49, 180_bytes] single-packet frame
+        if (frame.size() == MONO_IMG_RF_BYTES && frame[0] == PAYLOAD_TYPE_MONO_IMG) {
+            SniffedGroupMessage out;
+            out.channel_name = PUBLIC_CHANNEL_NAME;
+            out.channel_hash = compute_channel_hash(PUBLIC_CHANNEL_PSK);
+            out.psk = PUBLIC_CHANNEL_PSK;
+            out.sender = "Station";
+            out.text = "[1-Bit Tactical Bitmap 48x30]";
+            out.timestamp = 0;
+            out.is_mono_img = true;
+            std::memcpy(out.mono_img_bytes.data(), frame.data() + 1, MONO_IMG_BYTES);
+            return out;
+        }
+        // Channel-hashed raw 182-byte [ch_hash, 0x49, 180_bytes] single-packet frame
+        if (frame.size() == 1 + MONO_IMG_RF_BYTES && frame[1] == PAYLOAD_TYPE_MONO_IMG) {
+            uint8_t ch_hash = frame[0];
+            const auto& bucket = buckets[ch_hash];
+            SniffedGroupMessage out;
+            out.channel_name = bucket.empty() ? PUBLIC_CHANNEL_NAME : bucket.front().name;
+            out.channel_hash = ch_hash;
+            out.psk = bucket.empty() ? PUBLIC_CHANNEL_PSK : bucket.front().psk;
+            out.sender = "Station";
+            out.text = "[1-Bit Tactical Bitmap 48x30]";
+            out.timestamp = 0;
+            out.is_mono_img = true;
+            std::memcpy(out.mono_img_bytes.data(), frame.data() + 2, MONO_IMG_BYTES);
+            return out;
+        }
         if (frame.size() < 17) return std::nullopt;
         if (auto res = sniff_slice(frame.data(), frame.size())) {
             return res;
@@ -654,6 +1006,19 @@ public:
                 if (!dec) continue;
                 std::string sender, text;
                 uint32_t ts = 0;
+                std::array<uint8_t, MONO_IMG_BYTES> mono_bits{};
+                if (parse_decrypted_mono_image(*dec, sender, mono_bits, ts)) {
+                    return SniffedGroupMessage{
+                        cand.name,
+                        cand.channel_hash,
+                        cand.psk,
+                        sender,
+                        "[1-Bit Tactical Bitmap 48x30]",
+                        ts,
+                        true,
+                        mono_bits
+                    };
+                }
                 if (parse_decrypted_plaintext(*dec, sender, text, ts)) {
                     return SniffedGroupMessage{
                         cand.name,
@@ -661,7 +1026,9 @@ public:
                         cand.psk,
                         sender,
                         text,
-                        ts
+                        ts,
+                        false,
+                        {}
                     };
                 }
             }
@@ -671,6 +1038,139 @@ public:
 
 private:
     std::unordered_set<std::string> known_names_;
+
+    static bool parse_decrypted_mono_image(const std::vector<uint8_t>& dec,
+                                           std::string& sender,
+                                           std::array<uint8_t, MONO_IMG_BYTES>& out_bits,
+                                           uint32_t& timestamp) {
+        if (dec.size() < MONO_IMG_WIRE_LEN) return false;
+
+        // Format 1: [ts(4B), flags(1B), "Sender: ", 0x49 ('I!' wire or 180B raw)]
+        if (dec.size() >= 5 + MONO_IMG_WIRE_LEN) {
+            uint32_t ts = static_cast<uint32_t>(dec[0]) |
+                          (static_cast<uint32_t>(dec[1]) << 8) |
+                          (static_cast<uint32_t>(dec[2]) << 16) |
+                          (static_cast<uint32_t>(dec[3]) << 24);
+            bool plausible_ts = (ts >= 1577836800u && ts <= 2147483647u);
+            uint8_t flags = dec[4];
+
+            // Look for "Sender: " prefix in bytes [5 .. min(dec.size(), 75)) (allow UTF-8 callsigns)
+            size_t max_scan = std::min<size_t>(dec.size() - 5, 70);
+            size_t colon_pos = std::string::npos;
+            for (size_t i = 0; i + 1 < max_scan; ++i) {
+                uint8_t c = dec[5 + i];
+                if (c == ':' && dec[5 + i + 1] == ' ') {
+                    colon_pos = i;
+                    break;
+                }
+                if (c < 0x20 || c == 0x7F) break;
+            }
+
+            // Also check signed plain text offset (+4B pubkey prefix at dec[5..8])
+            size_t hdr_off = 5;
+            if (colon_pos == std::string::npos && dec.size() > 9 + MONO_IMG_WIRE_LEN) {
+                size_t max_scan2 = std::min<size_t>(dec.size() - 9, 70);
+                for (size_t i = 0; i + 1 < max_scan2; ++i) {
+                    uint8_t c = dec[9 + i];
+                    if (c == ':' && dec[9 + i + 1] == ' ') {
+                        colon_pos = i;
+                        hdr_off = 9;
+                        break;
+                    }
+                    if (c < 0x20 || c == 0x7F) break;
+                }
+            }
+
+            if (colon_pos != std::string::npos && colon_pos > 0) {
+                size_t body_off = hdr_off + colon_pos + 2;
+                // Case 1a: Companion-safe single-packet 0x49 ('I!') wire payload
+                if (body_off + MONO_IMG_WIRE_LEN <= dec.size() &&
+                    dec[body_off] == PAYLOAD_TYPE_MONO_IMG && dec[body_off + 1] == '!') {
+                    if (decode_mono_img_companion_wire(dec.data() + body_off, dec.size() - body_off, out_bits)) {
+                        sender = trim_str(std::string(reinterpret_cast<const char*>(dec.data() + hdr_off), colon_pos));
+                        if (!sender.empty()) {
+                            timestamp = plausible_ts ? ts : 0;
+                            return true;
+                        }
+                    }
+                }
+                // Case 1b: Raw 181-byte [0x49, 180_bytes]
+                if (body_off + MONO_IMG_RF_BYTES <= dec.size() && dec[body_off] == PAYLOAD_TYPE_MONO_IMG) {
+                    sender = trim_str(std::string(reinterpret_cast<const char*>(dec.data() + hdr_off), colon_pos));
+                    if (!sender.empty()) {
+                        std::memcpy(out_bits.data(), dec.data() + body_off + 1, MONO_IMG_BYTES);
+                        timestamp = plausible_ts ? ts : 0;
+                        return true;
+                    }
+                }
+                if (flags == PAYLOAD_TYPE_MONO_IMG && body_off + MONO_IMG_BYTES <= dec.size()) {
+                    sender = trim_str(std::string(reinterpret_cast<const char*>(dec.data() + hdr_off), colon_pos));
+                    if (!sender.empty()) {
+                        std::memcpy(out_bits.data(), dec.data() + body_off, MONO_IMG_BYTES);
+                        timestamp = plausible_ts ? ts : 0;
+                        return true;
+                    }
+                }
+            }
+
+            // Format 2: [ts(4B), 0x49, 180_bytes] or [ts(4B), flags, 'I!', ...] (no sender string prefix)
+            if (plausible_ts && 5 + MONO_IMG_WIRE_LEN <= dec.size() &&
+                dec[5] == PAYLOAD_TYPE_MONO_IMG && dec[6] == '!') {
+                if (decode_mono_img_companion_wire(dec.data() + 5, dec.size() - 5, out_bits)) {
+                    sender = "Station";
+                    timestamp = ts;
+                    return true;
+                }
+            }
+            if (plausible_ts && flags == PAYLOAD_TYPE_MONO_IMG && 5 + MONO_IMG_BYTES <= dec.size()) {
+                sender = "Station";
+                if (5 + MONO_IMG_RF_BYTES <= dec.size() && dec[5] == PAYLOAD_TYPE_MONO_IMG) {
+                    std::memcpy(out_bits.data(), dec.data() + 6, MONO_IMG_BYTES);
+                } else {
+                    std::memcpy(out_bits.data(), dec.data() + 5, MONO_IMG_BYTES);
+                }
+                timestamp = ts;
+                return true;
+            }
+        }
+
+        // Format 3: ["Sender: ", 0x49, ...] at offset 0
+        {
+            size_t max_scan = std::min<size_t>(dec.size(), 70);
+            size_t colon_pos = std::string::npos;
+            for (size_t i = 0; i + 1 < max_scan; ++i) {
+                uint8_t c = dec[i];
+                if (c == ':' && dec[i + 1] == ' ') {
+                    colon_pos = i;
+                    break;
+                }
+                if (c < 0x20 || c == 0x7F) break;
+            }
+            if (colon_pos != std::string::npos && colon_pos > 0) {
+                size_t body_off = colon_pos + 2;
+                if (body_off + MONO_IMG_WIRE_LEN <= dec.size() &&
+                    dec[body_off] == PAYLOAD_TYPE_MONO_IMG && dec[body_off + 1] == '!') {
+                    if (decode_mono_img_companion_wire(dec.data() + body_off, dec.size() - body_off, out_bits)) {
+                        sender = trim_str(std::string(reinterpret_cast<const char*>(dec.data()), colon_pos));
+                        if (!sender.empty()) {
+                            timestamp = 0;
+                            return true;
+                        }
+                    }
+                }
+                if (body_off + MONO_IMG_RF_BYTES <= dec.size() && dec[body_off] == PAYLOAD_TYPE_MONO_IMG) {
+                    sender = trim_str(std::string(reinterpret_cast<const char*>(dec.data()), colon_pos));
+                    if (!sender.empty()) {
+                        std::memcpy(out_bits.data(), dec.data() + body_off + 1, MONO_IMG_BYTES);
+                        timestamp = 0;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
 
     static bool is_valid_utf8_slice(const uint8_t* s, size_t n) {
         size_t i = 0;
@@ -755,6 +1255,7 @@ private:
                           (static_cast<uint32_t>(dec[3]) << 24);
             bool plausible_ts = (ts >= 1577836800u && ts <= 2147483647u);
             uint8_t flags = dec[4];
+            if (flags == PAYLOAD_TYPE_MONO_IMG) return false; // Handled by parse_decrypted_mono_image
             uint8_t txt_type_shifted = (flags >> 2) & 0x3F;
             uint8_t txt_type_low = flags & 0x0F;
 
