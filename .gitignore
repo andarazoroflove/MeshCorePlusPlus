@@ -1,0 +1,22 @@
+# Runtime state & logs (never commit personal radio logs or cached state)
+*.tsv
+*.log
+meshirc_state.json
+
+# Map tile cache & exports
+/tiles/
+/releases/tiles/
+/exports/
+/releases/exports/
+
+# Build intermediates
+*.pdb
+*.lib
+cpp/*.res
+/target/
+/src/
+Cargo.toml
+Cargo.lock
+
+# Legacy prototype binaries
+/releases/meshirc-*
