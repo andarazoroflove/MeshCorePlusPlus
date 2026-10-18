@@ -360,8 +360,10 @@ inline void mac_ble_handle_peripheral_locked(id central, id delegate, id periph,
 
 inline void mac_ble_did_update_state(id self, SEL, id central) {
     std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+    static long s_last_state = -1;
     long state = mac_msg_send<long>(central, sel_registerName("state"));
     if (state == 5) { // CBManagerStatePoweredOn
+        s_last_state = state;
         g_mac_ble.logs.push_back("[BLE] CoreBluetooth Powered ON. Checking connected NUS devices & scanning for SenseCAP T1000-E...");
         g_mac_ble.status_label = "BLE: Scanning for SenseCAP T1000-E / NUS...";
         g_mac_ble.status_connected = false;
@@ -386,17 +388,26 @@ inline void mac_ble_did_update_state(id self, SEL, id central) {
                                static_cast<id>(nullptr), static_cast<id>(nullptr));
         }
     } else if (state == 4) {
-        g_mac_ble.logs.push_back("[BLE] macOS Bluetooth is Powered OFF! Turn on Bluetooth in System Settings / Control Center.");
+        if (s_last_state != state) {
+            s_last_state = state;
+            g_mac_ble.logs.push_back("[BLE] macOS Bluetooth is Powered OFF! Turn on Bluetooth in System Settings / Control Center.");
+        }
         g_mac_ble.status_label = "BLE: Bluetooth Powered OFF";
         g_mac_ble.status_connected = false;
         g_mac_ble.status_dirty = true;
     } else if (state == 3) {
-        g_mac_ble.logs.push_back("[BLE] macOS Bluetooth permission denied! Enable MeshCore++ in System Settings -> Privacy & Security -> Bluetooth.");
-        g_mac_ble.status_label = "BLE: Permission Denied (Check Privacy Settings)";
+        if (s_last_state != state) {
+            s_last_state = state;
+            g_mac_ble.logs.push_back("[BLE] Waiting for macOS Bluetooth permission (Click 'Allow' in popup or enable MeshCore++ in System Settings -> Privacy & Security -> Bluetooth)...");
+        }
+        g_mac_ble.status_label = "BLE: Awaiting macOS Bluetooth Permission...";
         g_mac_ble.status_connected = false;
         g_mac_ble.status_dirty = true;
     } else if (state == 2) {
-        g_mac_ble.logs.push_back("[BLE] Bluetooth Low Energy (BLE) is unsupported on this Mac.");
+        if (s_last_state != state) {
+            s_last_state = state;
+            g_mac_ble.logs.push_back("[BLE] Bluetooth Low Energy (BLE) is unsupported on this Mac.");
+        }
         g_mac_ble.status_label = "BLE: Unsupported Hardware";
         g_mac_ble.status_connected = false;
         g_mac_ble.status_dirty = true;
@@ -1252,62 +1263,65 @@ private:
             g_mac_ble.rx_frames.clear();
             g_mac_ble.logs.clear();
 
-            if (!g_mac_ble.queue) {
-                g_mac_ble.queue = dispatch_queue_create("com.meshcore.ble", nullptr);
-            }
             if (!g_mac_ble.delegate) {
                 id d_alloc = mac_msg_send<id>(reinterpret_cast<id>(del_cls), sel_registerName("alloc"));
                 g_mac_ble.delegate = mac_msg_send<id>(d_alloc, sel_registerName("init"));
             }
+            if (g_mac_ble.central) {
+                long st = mac_msg_send<long>(g_mac_ble.central, sel_registerName("state"));
+                if (st != 5) {
+                    mac_msg_send<void>(g_mac_ble.central, sel_registerName("setDelegate:"), static_cast<id>(nullptr));
+                    CFRelease(g_mac_ble.central);
+                    g_mac_ble.central = nullptr;
+                }
+            }
             if (!g_mac_ble.central) {
                 id cm_alloc = mac_cls_send<id>("CBCentralManager", sel_registerName("alloc"));
+                // Pass nullptr queue so CBCentralManager binds to the main AppKit runloop for macOS Sonoma TCC authorization callbacks
                 g_mac_ble.central = mac_msg_send<id>(cm_alloc,
                                                      sel_registerName("initWithDelegate:queue:"),
-                                                     g_mac_ble.delegate, g_mac_ble.queue);
+                                                     g_mac_ble.delegate, static_cast<id>(nullptr));
             } else {
-                // Central already exists: check if requested device is already in our retained cache or restart scan
-                long st = mac_msg_send<long>(g_mac_ble.central, sel_registerName("state"));
-                if (st == 5) {
-                    bool connected_from_cache = false;
-                    if (!requested_ble_id.empty()) {
-                        for (const auto& rp : g_mac_ble.periphs) {
-                            if (rp.uuid == requested_ble_id || (!rp.name.empty() && rp.name == requested_ble_id)) {
-                                mac_ble_start_connect_locked(g_mac_ble.central, g_mac_ble.delegate, rp.periph, rp.name, rp.uuid);
-                                connected_from_cache = true;
-                                break;
-                            }
-                        }
-                    } else {
-                        for (const auto& d : g_mac_ble.discovered) {
-                            if (d.is_meshcore_candidate) {
-                                for (const auto& rp : g_mac_ble.periphs) {
-                                    if (rp.uuid == d.identifier) {
-                                        mac_ble_start_connect_locked(g_mac_ble.central, g_mac_ble.delegate, rp.periph, d.name, rp.uuid);
-                                        connected_from_cache = true;
-                                        break;
-                                    }
-                                }
-                                if (connected_from_cache) break;
-                            }
+                // Central already exists and is PoweredOn (5): check cache or restart scan
+                bool connected_from_cache = false;
+                if (!requested_ble_id.empty()) {
+                    for (const auto& rp : g_mac_ble.periphs) {
+                        if (rp.uuid == requested_ble_id || (!rp.name.empty() && rp.name == requested_ble_id)) {
+                            mac_ble_start_connect_locked(g_mac_ble.central, g_mac_ble.delegate, rp.periph, rp.name, rp.uuid);
+                            connected_from_cache = true;
+                            break;
                         }
                     }
-                    if (!connected_from_cache) {
-                        mac_msg_send<void>(g_mac_ble.central, sel_registerName("stopScan"));
-                        id nus_uuid = mac_cls_send<id>("CBUUID", sel_registerName("UUIDWithString:"),
-                                                       mac_ns_str("6E400001-B5A3-F393-E0A9-E50E24DCCA9E"));
-                        if (nus_uuid) {
-                            id arr = mac_cls_send<id>("NSArray", sel_registerName("arrayWithObject:"), nus_uuid);
-                            id conn_list = mac_msg_send<id>(g_mac_ble.central, sel_registerName("retrieveConnectedPeripheralsWithServices:"), arr);
-                            unsigned long cnt = conn_list ? mac_msg_send<unsigned long>(conn_list, sel_registerName("count")) : 0;
-                            for (unsigned long i = 0; i < cnt; ++i) {
-                                id p = mac_msg_send<id>(conn_list, sel_registerName("objectAtIndex:"), i);
-                                if (p) mac_ble_handle_peripheral_locked(g_mac_ble.central, g_mac_ble.delegate, p, nullptr, -45, true);
+                } else {
+                    for (const auto& d : g_mac_ble.discovered) {
+                        if (d.is_meshcore_candidate) {
+                            for (const auto& rp : g_mac_ble.periphs) {
+                                if (rp.uuid == d.identifier) {
+                                    mac_ble_start_connect_locked(g_mac_ble.central, g_mac_ble.delegate, rp.periph, d.name, rp.uuid);
+                                    connected_from_cache = true;
+                                    break;
+                                }
                             }
+                            if (connected_from_cache) break;
                         }
-                        if (!g_mac_ble.connecting && !g_mac_ble.connected) {
-                            mac_msg_send<void>(g_mac_ble.central, sel_registerName("scanForPeripheralsWithServices:options:"),
-                                               static_cast<id>(nullptr), static_cast<id>(nullptr));
+                    }
+                }
+                if (!connected_from_cache) {
+                    mac_msg_send<void>(g_mac_ble.central, sel_registerName("stopScan"));
+                    id nus_uuid = mac_cls_send<id>("CBUUID", sel_registerName("UUIDWithString:"),
+                                                   mac_ns_str("6E400001-B5A3-F393-E0A9-E50E24DCCA9E"));
+                    if (nus_uuid) {
+                        id arr = mac_cls_send<id>("NSArray", sel_registerName("arrayWithObject:"), nus_uuid);
+                        id conn_list = mac_msg_send<id>(g_mac_ble.central, sel_registerName("retrieveConnectedPeripheralsWithServices:"), arr);
+                        unsigned long cnt = conn_list ? mac_msg_send<unsigned long>(conn_list, sel_registerName("count")) : 0;
+                        for (unsigned long i = 0; i < cnt; ++i) {
+                            id p = mac_msg_send<id>(conn_list, sel_registerName("objectAtIndex:"), i);
+                            if (p) mac_ble_handle_peripheral_locked(g_mac_ble.central, g_mac_ble.delegate, p, nullptr, -45, true);
                         }
+                    }
+                    if (!g_mac_ble.connecting && !g_mac_ble.connected) {
+                        mac_msg_send<void>(g_mac_ble.central, sel_registerName("scanForPeripheralsWithServices:options:"),
+                                           static_cast<id>(nullptr), static_cast<id>(nullptr));
                     }
                 }
             }
@@ -1359,7 +1373,27 @@ private:
             last_handshake_t = std::chrono::steady_clock::now();
         };
 
+        auto last_auth_retry_t = std::chrono::steady_clock::now();
+
         while (running_) {
+            {
+                auto now_t = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now_t - last_auth_retry_t).count() >= 2500) {
+                    last_auth_retry_t = now_t;
+                    std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                    if (g_mac_ble.central && g_mac_ble.delegate) {
+                        long st = mac_msg_send<long>(g_mac_ble.central, sel_registerName("state"));
+                        if (st == 3) {
+                            mac_msg_send<void>(g_mac_ble.central, sel_registerName("setDelegate:"), static_cast<id>(nullptr));
+                            CFRelease(g_mac_ble.central);
+                            id cm_alloc = mac_cls_send<id>("CBCentralManager", sel_registerName("alloc"));
+                            g_mac_ble.central = mac_msg_send<id>(cm_alloc,
+                                                                 sel_registerName("initWithDelegate:queue:"),
+                                                                 g_mac_ble.delegate, static_cast<id>(nullptr));
+                        }
+                    }
+                }
+            }
             std::deque<std::string> pending_logs;
             std::deque<std::vector<uint8_t>> pending_rx;
             std::vector<DetectedBleDevice> dev_snapshot;

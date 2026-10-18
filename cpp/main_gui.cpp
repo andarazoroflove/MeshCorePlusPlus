@@ -744,12 +744,35 @@ enum class DockSide {
     Right
 };
 
+enum ModuleId : int {
+    MOD_JOINED_CHANNELS = 0,
+    MOD_RAINBOW_SNIFFER = 1,
+    MOD_PUBLIC_MESH     = 2,
+    MOD_HW_SLOTS        = 3
+};
+
+struct ModuleColumn {
+    std::vector<int> modules;   // ModuleId values (0..3), up to 4 stacked vertically
+    std::vector<float> weights; // Relative height weights for each stacked module
+    float width = 275.0f;
+};
+
+struct VertSplitterHit {
+    D2D1_RECT_F rect{};
+    int col_idx = -1;
+    bool invert_delta = false; // true for right-side columns where dragging left widens the column
+};
+
+struct HorizSplitterHit {
+    D2D1_RECT_F rect{};
+    int col_idx = -1;
+    int row_idx = -1; // splitter between row_idx and row_idx + 1
+};
+
 enum class DraggingSplitter {
     None,
-    LeftVertical,
-    RightVertical,
-    ChannelsInnerHorizontal,
-    MeshInnerHorizontal
+    ColumnWidth,
+    ModuleHeight
 };
 
 struct HitRect {
@@ -898,25 +921,30 @@ public:
     std::vector<DetectedBleDevice> cached_ble_devices;
     uint64_t copy_psk_feedback_until = 0;
 
-    // Resizable & Dockable Window Layout State
-    bool channels_visible = true;
-    bool mesh_visible = true;
-    DockSide channels_side = DockSide::Left;
-    DockSide mesh_side = DockSide::Right;
+    // Theme & 4-Column Drag-and-Drop Module Layout State
+    // Cols 0..1 are on the Left of the main chat window (up to 2 wide, up to 4 stacked each)
+    // Cols 2..3 are on the Right of the main chat window (up to 2 wide, up to 4 stacked each)
+    bool light_mode = false;
+    std::array<ModuleColumn, 4> module_cols;
 
-    float left_pane_width = 300.0f;
-    float right_pane_width = 300.0f;
-    float channels_split_ratio = 0.38f;
-    float mesh_split_ratio = 0.56f;
+    int dragging_module = -1;       // -1 if not dragging a module, else 0..3
+    bool module_drag_active = false;
+    bool drop_target_valid = false;
+    int drop_target_col = 0;        // 0..3 (or 10/11 for inserting a new outer/inner col on Left, 20/21 on Right)
+    int drop_target_row = 0;        // 0..4 vertical insertion slot
+    D2D1_RECT_F drop_preview_rect{};
 
     DraggingSplitter dragging_splitter = DraggingSplitter::None;
+    int active_splitter_col = -1;
+    int active_splitter_row = -1;
+    bool active_splitter_invert = false;
     POINT drag_start_mouse{0, 0};
     float drag_start_val = 0.0f;
+    float drag_start_val2 = 0.0f;
 
-    D2D1_RECT_F left_vert_splitter_rect{};
-    D2D1_RECT_F right_vert_splitter_rect{};
-    D2D1_RECT_F channels_horiz_splitter_rect{};
-    D2D1_RECT_F mesh_horiz_splitter_rect{};
+    std::vector<VertSplitterHit> vert_splitter_hits;
+    std::vector<HorizSplitterHit> horiz_splitter_hits;
+    std::vector<HitRect> module_header_hits;
 
     // Clickable hit regions populated every frame
     std::vector<HitRect> tab_hits;
@@ -935,6 +963,120 @@ public:
     D2D1_RECT_F sniffer_view_rect{};
     D2D1_RECT_F nodes_view_rect{};
     POINT mouse_pt{0, 0};
+
+    void init_default_module_layout() {
+        for (auto& c : module_cols) {
+            c.modules.clear();
+            c.weights.clear();
+            c.width = 275.0f;
+        }
+        module_cols[0].modules = {MOD_JOINED_CHANNELS, MOD_RAINBOW_SNIFFER};
+        module_cols[0].weights = {0.38f, 0.62f};
+        module_cols[0].width   = 290.0f;
+
+        module_cols[2].modules = {MOD_PUBLIC_MESH, MOD_HW_SLOTS};
+        module_cols[2].weights = {0.56f, 0.44f};
+        module_cols[2].width   = 290.0f;
+    }
+
+    void ensure_column_weights(ModuleColumn& c) {
+        if (c.weights.size() != c.modules.size()) {
+            c.weights.assign(c.modules.size(), 1.0f);
+        }
+        float sum = 0.0f;
+        for (float& w : c.weights) {
+            w = std::max(0.12f, w);
+            sum += w;
+        }
+        if (sum > 0.0f) {
+            for (float& w : c.weights) w /= sum;
+        }
+    }
+
+    // Moves module `mod_id` (0..3) into `target_col` (0..3, or 10=LeftOuterNew, 11=LeftInnerNew, 20=RightInnerNew, 21=RightOuterNew) at `target_row`
+    void apply_module_drop(int mod_id, int target_col, int target_row) {
+        if (mod_id < 0 || mod_id > 3) return;
+
+        // Remove mod_id from its current column
+        for (int c = 0; c < 4; ++c) {
+            auto& mvec = module_cols[c].modules;
+            auto& wvec = module_cols[c].weights;
+            for (size_t i = 0; i < mvec.size(); ++i) {
+                if (mvec[i] == mod_id) {
+                    mvec.erase(mvec.begin() + static_cast<ptrdiff_t>(i));
+                    if (i < wvec.size()) wvec.erase(wvec.begin() + static_cast<ptrdiff_t>(i));
+                    ensure_column_weights(module_cols[c]);
+                    break;
+                }
+            }
+        }
+
+        // Handle special "split into 2 columns on Left (10/11) or Right (20/21)" targets
+        if (target_col == 10) { // New outer-left column (col 0), shift existing left column to col 1 if col 0 was occupied
+            if (!module_cols[0].modules.empty() && module_cols[1].modules.empty()) {
+                module_cols[1] = std::move(module_cols[0]);
+                module_cols[0] = ModuleColumn{};
+            }
+            if (module_cols[0].width > 250.0f) module_cols[0].width = 245.0f;
+            if (module_cols[1].width > 250.0f) module_cols[1].width = 245.0f;
+            target_col = 0;
+            target_row = 0;
+        } else if (target_col == 11) { // New inner-left column (col 1), shift existing left column to col 0 if col 1 was occupied
+            if (!module_cols[1].modules.empty() && module_cols[0].modules.empty()) {
+                module_cols[0] = std::move(module_cols[1]);
+                module_cols[1] = ModuleColumn{};
+            }
+            if (module_cols[0].width > 250.0f) module_cols[0].width = 245.0f;
+            if (module_cols[1].width > 250.0f) module_cols[1].width = 245.0f;
+            target_col = 1;
+            target_row = 0;
+        } else if (target_col == 20) { // New inner-right column (col 2), shift existing right column to col 3 if col 2 was occupied
+            if (!module_cols[2].modules.empty() && module_cols[3].modules.empty()) {
+                module_cols[3] = std::move(module_cols[2]);
+                module_cols[2] = ModuleColumn{};
+            }
+            if (module_cols[2].width > 250.0f) module_cols[2].width = 245.0f;
+            if (module_cols[3].width > 250.0f) module_cols[3].width = 245.0f;
+            target_col = 2;
+            target_row = 0;
+        } else if (target_col == 21) { // New outer-right column (col 3), shift existing right column to col 2 if col 3 was occupied
+            if (!module_cols[3].modules.empty() && module_cols[2].modules.empty()) {
+                module_cols[2] = std::move(module_cols[3]);
+                module_cols[3] = ModuleColumn{};
+            }
+            if (module_cols[2].width > 250.0f) module_cols[2].width = 245.0f;
+            if (module_cols[3].width > 250.0f) module_cols[3].width = 245.0f;
+            target_col = 3;
+            target_row = 0;
+        }
+
+        target_col = std::clamp(target_col, 0, 3);
+        auto& dst = module_cols[target_col];
+        int ins_idx = std::clamp(target_row, 0, static_cast<int>(dst.modules.size()));
+        dst.modules.insert(dst.modules.begin() + ins_idx, mod_id);
+        dst.weights.assign(dst.modules.size(), 1.0f / static_cast<float>(dst.modules.size()));
+        ensure_column_weights(dst);
+
+        if (module_cols[0].modules.empty() && !module_cols[1].modules.empty()) {
+            module_cols[0] = std::move(module_cols[1]);
+            module_cols[1] = ModuleColumn{};
+        }
+        if (module_cols[2].modules.empty() && !module_cols[3].modules.empty()) {
+            module_cols[2] = std::move(module_cols[3]);
+            module_cols[3] = ModuleColumn{};
+        }
+        state_dirty = true;
+    }
+
+    static const char* module_title(int mod_id) {
+        switch (mod_id) {
+            case MOD_JOINED_CHANNELS: return "JOINED CHANNELS";
+            case MOD_RAINBOW_SNIFFER: return "256-BUCKET RAINBOW SNIFFER";
+            case MOD_PUBLIC_MESH:     return "PUBLIC MESH SYSTEM";
+            case MOD_HW_SLOTS:        return "RADIO HARDWARE SLOTS";
+            default:                  return "MODULE";
+        }
+    }
 
     // ---- Snooping toolkit state (Packet Inspector / Adverts / Paths / Exports) ----
     static constexpr size_t MAX_FRAMES = 4000;
@@ -1049,14 +1191,14 @@ public:
         if (!f) return;
         std::string active_name = (active_tab_idx < tabs.size()) ? tabs[active_tab_idx].name : PUBLIC_CHANNEL_NAME;
         f << "CFG\t" << tsv_escape(callsign)
-          << '\t' << (channels_visible ? 1 : 0)
-          << '\t' << (mesh_visible ? 1 : 0)
-          << '\t' << (channels_side == DockSide::Left ? 0 : 1)
-          << '\t' << (mesh_side == DockSide::Left ? 0 : 1)
-          << '\t' << left_pane_width
-          << '\t' << right_pane_width
-          << '\t' << channels_split_ratio
-          << '\t' << mesh_split_ratio
+          << '\t' << (light_mode ? 1 : 0)
+          << '\t' << 1
+          << '\t' << 0
+          << '\t' << 1
+          << '\t' << module_cols[0].width
+          << '\t' << module_cols[2].width
+          << '\t' << 0.38f
+          << '\t' << 0.56f
           << '\t' << std::setprecision(10) << map_nx
           << '\t' << std::setprecision(10) << map_ny
           << '\t' << map_zoom
@@ -1067,6 +1209,22 @@ public:
           << '\t' << self_lat_e6
           << '\t' << self_lon_e6
           << '\t' << tsv_escape(active_name) << '\n';
+
+        for (int c = 0; c < 4; ++c) {
+            std::ostringstream mods_s, weights_s;
+            for (size_t i = 0; i < module_cols[c].modules.size(); ++i) {
+                if (i > 0) mods_s << ',';
+                mods_s << module_cols[c].modules[i];
+            }
+            for (size_t i = 0; i < module_cols[c].weights.size(); ++i) {
+                if (i > 0) weights_s << ',';
+                weights_s << std::fixed << std::setprecision(3) << module_cols[c].weights[i];
+            }
+            f << "LAYOUT\t" << c
+              << '\t' << module_cols[c].width
+              << '\t' << mods_s.str()
+              << '\t' << weights_s.str() << '\n';
+        }
 
         for (size_t i = 2; i < tabs.size(); ++i) {
             f << "TAB\t" << tsv_escape(tabs[i].name) << '\n';
@@ -1119,6 +1277,10 @@ public:
         std::string line;
         std::string target_active = PUBLIC_CHANNEL_NAME;
         size_t loaded_msgs = 0;
+        bool has_layout_rows = false;
+        std::array<ModuleColumn, 4> loaded_cols;
+        for (auto& c : loaded_cols) c.width = 275.0f;
+
         while (std::getline(f, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) continue;
@@ -1128,14 +1290,6 @@ public:
             try {
                 if (tag == "CFG" && cols.size() >= 20) {
                     if (!cols[1].empty()) callsign = cols[1];
-                    channels_visible = std::stoi(cols[2]) != 0;
-                    mesh_visible = std::stoi(cols[3]) != 0;
-                    channels_side = std::stoi(cols[4]) == 0 ? DockSide::Left : DockSide::Right;
-                    mesh_side = std::stoi(cols[5]) == 0 ? DockSide::Left : DockSide::Right;
-                    left_pane_width = std::clamp(std::stof(cols[6]), 180.0f, 650.0f);
-                    right_pane_width = std::clamp(std::stof(cols[7]), 180.0f, 650.0f);
-                    channels_split_ratio = std::clamp(std::stof(cols[8]), 0.15f, 0.85f);
-                    mesh_split_ratio = std::clamp(std::stof(cols[9]), 0.15f, 0.85f);
                     map_nx = std::clamp(std::stod(cols[10]), 0.0, 1.0);
                     map_ny = std::clamp(std::stod(cols[11]), 0.0, 1.0);
                     map_zoom = std::clamp(std::stoi(cols[12]), 2, 18);
@@ -1146,6 +1300,34 @@ public:
                     self_lat_e6 = std::stoi(cols[17]);
                     self_lon_e6 = std::stoi(cols[18]);
                     target_active = cols[19];
+                    // If LAYOUT rows exist in this file, cols[2] is light_mode
+                    light_mode = (std::stoi(cols[2]) != 0 && std::stoi(cols[3]) == 1 && std::stof(cols[8]) == 0.38f);
+                } else if (tag == "LAYOUT" && cols.size() >= 5) {
+                    has_layout_rows = true;
+                    int cidx = std::clamp(std::stoi(cols[1]), 0, 3);
+                    loaded_cols[cidx].width = std::clamp(std::stof(cols[2]), 180.0f, 600.0f);
+                    loaded_cols[cidx].modules.clear();
+                    loaded_cols[cidx].weights.clear();
+                    if (!cols[3].empty()) {
+                        std::stringstream ss(cols[3]);
+                        std::string item;
+                        while (std::getline(ss, item, ',')) {
+                            if (!item.empty()) {
+                                int mid = std::stoi(item);
+                                if (mid >= 0 && mid <= 3) loaded_cols[cidx].modules.push_back(mid);
+                            }
+                        }
+                    }
+                    if (!cols[4].empty()) {
+                        std::stringstream ss(cols[4]);
+                        std::string item;
+                        while (std::getline(ss, item, ',')) {
+                            if (!item.empty()) {
+                                loaded_cols[cidx].weights.push_back(std::stof(item));
+                            }
+                        }
+                    }
+                    ensure_column_weights(loaded_cols[cidx]);
                 } else if (tag == "TAB" && cols.size() >= 2) {
                     std::string ch = trim_str(cols[1]);
                     if (!ch.empty() && ch != CONSOLE_TAB && normalize_channel_name(ch) != PUBLIC_CHANNEL_NAME) {
@@ -1200,6 +1382,11 @@ public:
                     }
                 } else if (tag == "MSG" && cols.size() >= 11) {
                     const std::string& tname = cols[1];
+                    // Filter out legacy mirrored #hashtag notices that were previously saved into Public
+                    if (normalize_channel_name(tname) == PUBLIC_CHANNEL_NAME &&
+                        cols[3].find(" @ #") != std::string::npos) {
+                        continue;
+                    }
                     for (auto& tab : tabs) {
                         if (_stricmp(tab.name.c_str(), tname.c_str()) == 0 ||
                             normalize_channel_name(tab.name) == normalize_channel_name(tname)) {
@@ -1221,6 +1408,31 @@ public:
                 }
             } catch (...) {}
         }
+
+        if (has_layout_rows) {
+            // Verify all 4 modules (0..3) are present exactly once across loaded_cols
+            std::array<bool, 4> seen{false, false, false, false};
+            for (int c = 0; c < 4; ++c) {
+                std::vector<int> clean_mods;
+                for (int m : loaded_cols[c].modules) {
+                    if (m >= 0 && m <= 3 && !seen[m]) {
+                        seen[m] = true;
+                        clean_mods.push_back(m);
+                    }
+                }
+                loaded_cols[c].modules = std::move(clean_mods);
+                ensure_column_weights(loaded_cols[c]);
+            }
+            for (int m = 0; m < 4; ++m) {
+                if (!seen[m]) {
+                    int target_c = (m < 2) ? 0 : 2;
+                    loaded_cols[target_c].modules.push_back(m);
+                    ensure_column_weights(loaded_cols[target_c]);
+                }
+            }
+            module_cols = std::move(loaded_cols);
+        }
+
         sort_and_recount_mesh_nodes();
         sort_discovered();
         for (size_t i = 0; i < tabs.size(); ++i) {
@@ -1239,6 +1451,7 @@ public:
 
     MeshGuiApp() {
         for (int i = 0; i < 36; ++i) snr_history.push_back(0.0f);
+        init_default_module_layout();
 
         // Load wordlist from exe directory as well
         rainbow.load_wordlist(from_wide(exe_dir() + L"wordlist.txt"));
@@ -2582,21 +2795,6 @@ public:
         msg.trace_key = dedup_key;
         if (route) msg.routes.push_back(*route);
 
-        // If message arrived on a #hashtag channel, also surface a live feed entry in Public so the user sees all mesh activity!
-        if (ch != PUBLIC_CHANNEL_NAME && tabs.size() > 1) {
-            ChatMessage pub_notice{
-                now_hms_str(),
-                sender + " @ " + ch,
-                true, rssi, snr, hops,
-                full_text + " (in " + ch + ")",
-                false, is_mention, false
-            };
-            pub_notice.trace_key = dedup_key;
-            pub_notice.routes = msg.routes;
-            tabs[1].update_station(sender, rssi, snr, hops);
-            tabs[1].messages.push_back(pub_notice);
-        }
-
         log_console("[CHAT " + ch + "] <" + sender + "> " + text +
                     (path_desc.empty() ? "" : (" [" + path_desc + "]")));
 
@@ -3270,7 +3468,9 @@ enum ButtonId {
     BTN_MAP_RNEIGHBORS = 63,
     BTN_MAP_RESET_PATH = 64,
     BTN_PKT_RECORD = 65,
-    BTN_PKT_REPLAY = 66
+    BTN_PKT_REPLAY = 66,
+    BTN_TOGGLE_THEME = 67,
+    BTN_RESET_LAYOUT = 68
 };
 
 class D2DRenderer {
@@ -3278,6 +3478,7 @@ public:
     ID2D1Factory* d2d_factory = nullptr;
     IDWriteFactory* dwrite_factory = nullptr;
     ID2D1DCRenderTarget* rt = nullptr;
+    bool light_mode = false;
 
     IDWriteTextFormat* font_title = nullptr;
     IDWriteTextFormat* font_ui = nullptr;
@@ -3435,7 +3636,51 @@ public:
 
     void resize(UINT, UINT) {}
 
-    static D2D1_COLOR_F hex_color(uint32_t rgb, float alpha = 1.0f) {
+    D2D1_COLOR_F hex_color(uint32_t rgb, float alpha = 1.0f) const {
+        if (light_mode) {
+            switch (rgb) {
+                // Backgrounds & Surfaces (Dark -> Crisp Light Slate/White)
+                case 0x05080F: rgb = 0xE2E8F0; break;
+                case 0x090D16: rgb = 0xEEF2F6; break;
+                case 0x0B111E: rgb = 0xF1F5F9; break;
+                case 0x0F172A: rgb = 0xFFFFFF; break;
+                case 0x111A2B: rgb = 0xF8FAFC; break;
+                case 0x131C2E: rgb = 0xF1F5F9; break;
+                case 0x141E30: rgb = 0xF1F5F9; break;
+                case 0x162032: rgb = 0xE2E8F0; break;
+                case 0x162238: rgb = 0xE0F2FE; break;
+                case 0x16243D: rgb = 0xE0F2FE; break;
+                // Borders & Dividers
+                case 0x1E293B: rgb = 0xCBD5E1; break;
+                case 0x26354D: rgb = 0x94A3B8; break;
+                case 0x334155: rgb = 0x94A3B8; break;
+                case 0x475569: rgb = 0x64748B; break;
+                // Foregrounds & Text (Light -> Deep Ink Slate)
+                case 0xF8FAFC: rgb = 0x0F172A; break;
+                case 0xF1F5F9: rgb = 0x0F172A; break;
+                case 0xE2E8F0: rgb = 0x1E293B; break;
+                case 0xCBD5E1: rgb = 0x334155; break;
+                case 0x94A3B8: rgb = 0x475569; break;
+                case 0x64748B: rgb = 0x64748B; break;
+                // Tactical Accents (Tuned for high readability on white/light surfaces)
+                case 0x00E5FF: rgb = 0x0284C7; break;
+                case 0x38BDF8: rgb = 0x0369A1; break;
+                case 0x10B981: rgb = 0x059669; break;
+                case 0x34D399: rgb = 0x047857; break;
+                case 0xFBBF24: rgb = 0xB45309; break;
+                case 0xF59E0B: rgb = 0xD97706; break;
+                case 0xA855F7: rgb = 0x7E22CE; break;
+                case 0xC084FC: rgb = 0x6B21A8; break;
+                case 0xA78BFA: rgb = 0x5B21B6; break;
+                case 0xF472B6: rgb = 0xBE185D; break;
+                case 0x2DD4BF: rgb = 0x0F766E; break;
+                case 0xFB923C: rgb = 0xC2410C; break;
+                case 0x60A5FA: rgb = 0x1D4ED8; break;
+                case 0xFCA5A5: rgb = 0xB91C1C; break;
+                case 0xEF4444: rgb = 0xDC2626; break;
+                default: break;
+            }
+        }
         return D2D1::ColorF(
             static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
             static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
@@ -3516,6 +3761,7 @@ public:
     void render(HWND hwnd, HDC target_hdc, MeshGuiApp& app) {
         ensure_target();
         if (!rt || !target_hdc) return;
+        light_mode = app.light_mode;
 
         RECT rc;
         GetClientRect(hwnd, &rc);
@@ -3542,6 +3788,9 @@ public:
         app.ble_menu_hits.clear();
         app.packet_row_hits.clear();
         app.map_pin_hits.clear();
+        app.vert_splitter_hits.clear();
+        app.horiz_splitter_hits.clear();
+        app.module_header_hits.clear();
         ++frame_no;
         decodes_this_frame = 0;
 
@@ -3552,7 +3801,7 @@ public:
         rt->Clear(hex_color(0x090D16));
 
         // ====================================================================
-        // 1. TOP TELEMETRY & TRANSPORT CONTROL BAR (y: 0..64)
+        // 1. TOP TELEMETRY & TRANSPORT CONTROL BAR (y: 0..62)
         // ====================================================================
         D2D1_RECT_F top_bar = D2D1::RectF(0, 0, W, 62);
         fill_round_rect(top_bar, 0.0f, hex_color(0x0F172A));
@@ -3570,7 +3819,7 @@ public:
         draw_text("MESHCORE++", font_title, D2D1::RectF(26, 12, 162, 34), hex_color(0x00E5FF));
         draw_text("C++20 NATIVE SDR/IRC", font_small, D2D1::RectF(26, 32, 162, 48), hex_color(0x94A3B8));
 
-        // Transport Buttons: [USB Serial ▾] [BLE NUS] [RF Sim: ON] [+ #Tag]
+        // Transport & Theme Buttons: [USB Serial ▾] [BLE NUS ▾] [RF Sim] [+ #Tag] [☀ Light / ☾ Dark]
         auto draw_top_btn = [&](int id, float x, float w, const std::string& label, bool active, uint32_t accent_hex) {
             D2D1_RECT_F r = D2D1::RectF(x, 14, x + w, 48);
             bool hovered = pt_in_rect(app.mouse_pt, r);
@@ -3594,57 +3843,15 @@ public:
                                       ? ((app.connected_port.empty() ? "USB" : app.connected_port) + ": " + app.device_model + " v")
                                       : "USB Serial v";
 
-        draw_top_btn(BTN_USB_SERIAL, 176, 142, usb_btn_lbl, serial_active, 0x10B981);
-        draw_top_btn(BTN_BLE_NUS,    324, 88,  "BLE NUS v", ble_active,    0x38BDF8);
-        draw_top_btn(BTN_RF_SIM,     418, 114, app.is_sim ? "RF Sim: LIVE" : "RF Sim: OFF", app.is_sim, 0x00E5FF);
-        draw_top_btn(BTN_ADD_TAG,    538, 92,  "+ #Tag",    false,        0xA855F7);
-        draw_top_btn(BTN_TOGGLE_CHANNELS, 636, 106, app.channels_visible ? "◨ Chans [ON]" : "◨ Chans [OFF]", app.channels_visible, 0x10B981);
-        draw_top_btn(BTN_TOGGLE_MESH,     748, 102, app.mesh_visible     ? "◧ Mesh [ON]"  : "◧ Mesh [OFF]",  app.mesh_visible,     0x00E5FF);
-        draw_top_btn(BTN_SWAP_DOCKS,      856, 76,  "⇄ Swap",   false, 0xFBBF24);
+        draw_top_btn(BTN_USB_SERIAL,   176, 142, usb_btn_lbl, serial_active, 0x10B981);
+        draw_top_btn(BTN_BLE_NUS,      324, 88,  "BLE NUS v", ble_active,    0x38BDF8);
+        draw_top_btn(BTN_RF_SIM,       418, 114, app.is_sim ? "RF Sim: LIVE" : "RF Sim: OFF", app.is_sim, 0x00E5FF);
+        draw_top_btn(BTN_ADD_TAG,      538, 86,  "+ #Tag",    false,        0xA855F7);
+        draw_top_btn(BTN_TOGGLE_THEME, 630, 88,  app.light_mode ? "\xe2\x98\xbe Dark" : "\xe2\x98\x80 Light", app.light_mode, 0xFBBF24);
 
-        // Right-aligned elements boundary
+        // Right-aligned Battery Gauge & Callsign Badge (no overlapping box behind battery!)
         float right_x = W - 14.0f;
 
-        // Live RF SNR Sparkline & Public System Telemetry Card
-        float spark_x = 938;
-        float spark_w = std::max(90.0f, right_x - 350.0f - spark_x);
-        D2D1_RECT_F spark_rect = D2D1::RectF(spark_x, 10, spark_x + spark_w, 52);
-        fill_round_rect(spark_rect, 7.0f, hex_color(0x0B111E));
-        draw_round_rect(spark_rect, 7.0f, hex_color(0x1E293B), 1.0f);
-
-        std::ostringstream rf_oss;
-        rf_oss << std::fixed << std::setprecision(3) << (app.radio_freq_khz / 1000.0) << "MHz SF"
-               << static_cast<int>(app.radio_sf) << " | MESH: " << app.mesh_nodes.size() << " NODES";
-        if (app.has_last_rf) {
-            rf_oss << " | RX " << app.last_rssi << "dBm/"
-                   << std::showpos << std::setprecision(1) << app.last_snr << "dB" << std::noshowpos;
-        }
-        rf_oss << " | AIR: " << std::fixed << std::setprecision(1) << app.channel_busy_pct() << "%";
-        draw_text(rf_oss.str(), font_mono_small, D2D1::RectF(spark_x + 8, 11, spark_x + spark_w - 8, 27),
-                  hex_color(0x38BDF8));
-
-        // Draw SNR waveform line inside spark_rect
-        if (app.snr_history.size() > 1) {
-            ID2D1SolidColorBrush* wave_brush = nullptr;
-            rt->CreateSolidColorBrush(hex_color(0x10B981), &wave_brush);
-            if (wave_brush) {
-                float gx0 = spark_x + 10.0f;
-                float gx1 = spark_x + spark_w - 10.0f;
-                float gy0 = 29.0f;
-                float gy1 = 48.0f;
-                float step = (gx1 - gx0) / static_cast<float>(app.snr_history.size() - 1);
-                for (size_t i = 0; i + 1 < app.snr_history.size(); ++i) {
-                    float norm0 = std::clamp((app.snr_history[i] + 5.0f) / 18.0f, 0.0f, 1.0f);
-                    float norm1 = std::clamp((app.snr_history[i + 1] + 5.0f) / 18.0f, 0.0f, 1.0f);
-                    D2D1_POINT_2F p0 = D2D1::Point2F(gx0 + i * step, gy1 - norm0 * (gy1 - gy0));
-                    D2D1_POINT_2F p1 = D2D1::Point2F(gx0 + (i + 1) * step, gy1 - norm1 * (gy1 - gy0));
-                    rt->DrawLine(p0, p1, wave_brush, 1.7f);
-                }
-                wave_brush->Release();
-            }
-        }
-
-        // Right-aligned Battery Gauge & Callsign Badge
         D2D1_RECT_F call_rect = D2D1::RectF(right_x - 186, 14, right_x, 48);
         bool call_focus = (app.active_input == ActiveInputTarget::CallsignEditor);
         fill_round_rect(call_rect, 7.0f, call_focus ? hex_color(0x1E293B) : hex_color(0x141E30));
@@ -3667,73 +3874,146 @@ public:
         fill_round_rect(D2D1::RectF(bbar_bg.left, bbar_bg.top, bbar_bg.left + fill_w, bbar_bg.bottom),
                         3.0f, hex_color(0x10B981));
 
+        // Clean inline RF status text if there is space between the buttons and the battery gauge
+        if (bat_rect.left - 730.0f >= 140.0f) {
+            std::ostringstream rf_oss;
+            rf_oss << std::fixed << std::setprecision(3) << (app.radio_freq_khz / 1000.0) << "MHz SF"
+                   << static_cast<int>(app.radio_sf) << " | " << app.mesh_nodes.size() << " NODES";
+            if (app.has_last_rf) {
+                rf_oss << " | RX " << app.last_rssi << "dBm/"
+                       << std::showpos << std::setprecision(1) << app.last_snr << "dB" << std::noshowpos;
+            }
+            rf_oss << " | AIR " << std::fixed << std::setprecision(1) << app.channel_busy_pct() << "%";
+            draw_text(rf_oss.str(), font_mono_small, D2D1::RectF(730.0f, 14.0f, bat_rect.left - 10.0f, 48.0f),
+                      hex_color(0x38BDF8), DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+
         // ====================================================================
-        // DYNAMIC 3-PANE WORKSPACE LAYOUT (y: 72 .. H - 12)
-        // Supports interactive resizing, left/right swapping, and closing/expanding
+        // 2. 4-MODULE DRAG-AND-DROP WORKSPACE LAYOUT (y: 72 .. H - 12)
+        // Up to 2 columns wide on either side of the main chat window,
+        // and up to 4 modules stacked vertically in any column!
         // ====================================================================
         float pane_top = 72.0f;
         float pane_bottom = H - 12.0f;
         float pane_h = pane_bottom - pane_top;
-
-        bool left_is_channels = (app.channels_side == DockSide::Left);
-        bool has_left_dock = left_is_channels ? app.channels_visible : app.mesh_visible;
-        bool has_right_dock = left_is_channels ? app.mesh_visible : app.channels_visible;
-
         float splitter_w = 6.0f;
-        float left_w = has_left_dock ? std::clamp(app.left_pane_width, 180.0f, W * 0.45f) : 0.0f;
-        float right_w = has_right_dock ? std::clamp(app.right_pane_width, 180.0f, W * 0.45f) : 0.0f;
 
-        float cur_x = 12.0f;
-        if (has_left_dock) {
-            if (left_is_channels) {
-                render_channels_dock(app, cur_x, pane_top, left_w, pane_h, true);
-            } else {
-                render_mesh_dock(app, cur_x, pane_top, left_w, pane_h, true);
+        // Calculate active column widths for Left (cols 0, 1) and Right (cols 2, 3)
+        std::array<float, 4> col_w{0.0f, 0.0f, 0.0f, 0.0f};
+        float total_side_w = 0.0f;
+        int active_col_count = 0;
+        for (int c = 0; c < 4; ++c) {
+            if (!app.module_cols[c].modules.empty()) {
+                col_w[c] = std::clamp(app.module_cols[c].width, 190.0f, 520.0f);
+                total_side_w += col_w[c];
+                ++active_col_count;
             }
-            cur_x += left_w;
-
-            // Vertical splitter rect between left dock and center
-            app.left_vert_splitter_rect = D2D1::RectF(cur_x, pane_top, cur_x + splitter_w, pane_bottom);
-            bool split_hov = pt_in_rect(app.mouse_pt, app.left_vert_splitter_rect) ||
-                             app.dragging_splitter == DraggingSplitter::LeftVertical;
-            fill_round_rect(app.left_vert_splitter_rect, 2.0f, split_hov ? hex_color(0x00E5FF, 0.7f) : hex_color(0x1E293B, 0.4f));
-            cur_x += splitter_w;
-        } else {
-            app.left_vert_splitter_rect = D2D1::RectF(0, 0, 0, 0);
+        }
+        // Ensure at least 320px remains for the center chat workstation
+        float max_side_total = std::max(240.0f, W - 24.0f - 320.0f - active_col_count * splitter_w);
+        if (total_side_w > max_side_total && total_side_w > 0.0f) {
+            float scale = max_side_total / total_side_w;
+            for (int c = 0; c < 4; ++c) col_w[c] *= scale;
+            total_side_w = max_side_total;
         }
 
-        float right_avail = has_right_dock ? (right_w + splitter_w) : 0.0f;
-        float center_w = std::max(280.0f, (W - 12.0f - right_avail) - cur_x);
-        render_tool_strip(app, cur_x, pane_top, center_w);
+        std::array<D2D1_RECT_F, 4> col_rects{};
+        std::array<std::vector<D2D1_RECT_F>, 4> mod_rects{};
+
+        auto render_module_column = [&](int c, float cx, float cw, bool is_right_side) {
+            auto& col = app.module_cols[c];
+            app.ensure_column_weights(col);
+            col_rects[c] = D2D1::RectF(cx, pane_top, cx + cw, pane_bottom);
+
+            size_t n = col.modules.size();
+            float split_h = 8.0f;
+            float avail_h = std::max(80.0f, pane_h - static_cast<float>(n > 0 ? (n - 1) : 0) * split_h);
+            float my = pane_top;
+
+            for (size_t i = 0; i < n; ++i) {
+                float mh = (i + 1 == n) ? (pane_bottom - my) : std::max(72.0f, avail_h * col.weights[i]);
+                D2D1_RECT_F mr = D2D1::RectF(cx, my, cx + cw, my + mh);
+                mod_rects[c].push_back(mr);
+                render_single_module(app, col.modules[i], cx, my, cw, mh);
+                my += mh;
+
+                if (i + 1 < n) {
+                    D2D1_RECT_F hsr = D2D1::RectF(cx, my, cx + cw, my + split_h);
+                    bool h_hov = pt_in_rect(app.mouse_pt, hsr) ||
+                                 (app.dragging_splitter == DraggingSplitter::ModuleHeight &&
+                                  app.active_splitter_col == c && app.active_splitter_row == static_cast<int>(i));
+                    fill_round_rect(hsr, 2.0f, h_hov ? hex_color(0x00E5FF, 0.45f) : hex_color(0x0B111E));
+                    float cx_grip = cx + cw * 0.5f;
+                    fill_round_rect(D2D1::RectF(cx_grip - 14, my + 3, cx_grip + 14, my + 5), 1.0f,
+                                    h_hov ? hex_color(0x00E5FF) : hex_color(0x334155));
+                    app.horiz_splitter_hits.push_back({hsr, c, static_cast<int>(i)});
+                    my += split_h;
+                }
+            }
+        };
+
+        float cur_x = 12.0f;
+        // Left Side Columns (0 and 1)
+        for (int c = 0; c < 2; ++c) {
+            if (!app.module_cols[c].modules.empty()) {
+                render_module_column(c, cur_x, col_w[c], false);
+                cur_x += col_w[c];
+
+                D2D1_RECT_F vsr = D2D1::RectF(cur_x, pane_top, cur_x + splitter_w, pane_bottom);
+                bool v_hov = pt_in_rect(app.mouse_pt, vsr) ||
+                             (app.dragging_splitter == DraggingSplitter::ColumnWidth && app.active_splitter_col == c);
+                fill_round_rect(vsr, 2.0f, v_hov ? hex_color(0x00E5FF, 0.7f) : hex_color(0x1E293B, 0.4f));
+                app.vert_splitter_hits.push_back({vsr, c, false});
+                cur_x += splitter_w;
+            }
+        }
+
+        float right_total_w = 0.0f;
+        for (int c = 2; c < 4; ++c) {
+            if (!app.module_cols[c].modules.empty()) {
+                right_total_w += col_w[c] + splitter_w;
+            }
+        }
+
+        float center_x = cur_x;
+        float center_w = std::max(280.0f, (W - 12.0f - right_total_w) - center_x);
+        D2D1_RECT_F center_zone_rect = D2D1::RectF(center_x, pane_top, center_x + center_w, pane_bottom);
+
+        render_tool_strip(app, center_x, pane_top, center_w);
         {
             float vy = pane_top + 38.0f;
             float vh = pane_h - 38.0f;
-            app.tool_view_rect = D2D1::RectF(cur_x, vy, cur_x + center_w, vy + vh);
+            app.tool_view_rect = D2D1::RectF(center_x, vy, center_x + center_w, vy + vh);
             switch (app.center_view) {
-                case CenterView::Packets: render_packets_view(app, cur_x, vy, center_w, vh); break;
-                case CenterView::Adverts: render_adverts_view(app, cur_x, vy, center_w, vh); break;
-                case CenterView::Paths:   render_paths_view(app, cur_x, vy, center_w, vh); break;
-                case CenterView::Map:     render_map_view(app, cur_x, vy, center_w, vh); break;
-                default:                  render_center_workstation(app, cur_x, vy, center_w, vh); break;
+                case CenterView::Packets: render_packets_view(app, center_x, vy, center_w, vh); break;
+                case CenterView::Adverts: render_adverts_view(app, center_x, vy, center_w, vh); break;
+                case CenterView::Paths:   render_paths_view(app, center_x, vy, center_w, vh); break;
+                case CenterView::Map:     render_map_view(app, center_x, vy, center_w, vh); break;
+                default:                  render_center_workstation(app, center_x, vy, center_w, vh); break;
             }
         }
         cur_x += center_w;
 
-        if (has_right_dock) {
-            // Vertical splitter rect between center and right dock
-            app.right_vert_splitter_rect = D2D1::RectF(cur_x, pane_top, cur_x + splitter_w, pane_bottom);
-            bool split_hov = pt_in_rect(app.mouse_pt, app.right_vert_splitter_rect) ||
-                             app.dragging_splitter == DraggingSplitter::RightVertical;
-            fill_round_rect(app.right_vert_splitter_rect, 2.0f, split_hov ? hex_color(0x00E5FF, 0.7f) : hex_color(0x1E293B, 0.4f));
-            cur_x += splitter_w;
+        // Right Side Columns (2 and 3)
+        for (int c = 2; c < 4; ++c) {
+            if (!app.module_cols[c].modules.empty()) {
+                D2D1_RECT_F vsr = D2D1::RectF(cur_x, pane_top, cur_x + splitter_w, pane_bottom);
+                bool v_hov = pt_in_rect(app.mouse_pt, vsr) ||
+                             (app.dragging_splitter == DraggingSplitter::ColumnWidth && app.active_splitter_col == c);
+                fill_round_rect(vsr, 2.0f, v_hov ? hex_color(0x00E5FF, 0.7f) : hex_color(0x1E293B, 0.4f));
+                app.vert_splitter_hits.push_back({vsr, c, true});
+                cur_x += splitter_w;
 
-            if (left_is_channels) {
-                render_mesh_dock(app, cur_x, pane_top, right_w, pane_h, false);
-            } else {
-                render_channels_dock(app, cur_x, pane_top, right_w, pane_h, false);
+                render_module_column(c, cur_x, col_w[c], true);
+                cur_x += col_w[c];
             }
-        } else {
-            app.right_vert_splitter_rect = D2D1::RectF(0, 0, 0, 0);
+        }
+
+        // ====================================================================
+        // 3. LIVE DRAG-AND-DROP OVERLAY & DROP ZONE COMPUTATION
+        // ====================================================================
+        if (app.module_drag_active && app.dragging_module >= 0) {
+            update_and_draw_module_drag_overlay(app, W, pane_top, pane_bottom, center_zone_rect, col_rects, mod_rects);
         }
 
         // Render COM Port or BLE NUS Selector Dropdown Modal if open
@@ -3758,31 +4038,168 @@ public:
     }
 
 private:
+    void draw_module_drag_header(MeshGuiApp& app, int mod_id, float x, float y, float w,
+                                 const std::string& title, uint32_t accent_hex, float right_pad = 10.0f) {
+        D2D1_RECT_F hdr_r = D2D1::RectF(x, y, x + w - right_pad, y + 28.0f);
+        bool hov = pt_in_rect(app.mouse_pt, hdr_r);
+        bool is_dragging_this = (app.module_drag_active && app.dragging_module == mod_id);
+        if (hov || is_dragging_this) {
+            fill_round_rect(D2D1::RectF(x + 4, y + 3, x + w - 4, y + 26), 6.0f,
+                            hex_color(accent_hex, is_dragging_this ? 0.25f : 0.12f));
+        }
+        draw_text("\xe2\xa0\xbf " + title, font_small,
+                  D2D1::RectF(x + 12, y + 6, x + w - 42, y + 26), hex_color(accent_hex));
+        draw_text(hov ? "DRAG" : "\xe2\x87\x86", font_mono_small,
+                  D2D1::RectF(x + w - 48, y + 6, x + w - 10, y + 26),
+                  hov ? hex_color(accent_hex) : hex_color(0x64748B), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        app.module_header_hits.push_back({hdr_r, mod_id, title});
+    }
+
+    void update_and_draw_module_drag_overlay(MeshGuiApp& app, float W, float pane_top, float pane_bottom,
+                                             const D2D1_RECT_F& center_zone,
+                                             const std::array<D2D1_RECT_F, 4>& col_rects,
+                                             const std::array<std::vector<D2D1_RECT_F>, 4>& mod_rects) {
+        float mx = static_cast<float>(app.mouse_pt.x);
+        float my = static_cast<float>(app.mouse_pt.y);
+        app.drop_target_valid = false;
+
+        bool left_has_0 = !app.module_cols[0].modules.empty();
+        bool left_has_1 = !app.module_cols[1].modules.empty();
+        int left_cols = (left_has_0 ? 1 : 0) + (left_has_1 ? 1 : 0);
+
+        bool right_has_2 = !app.module_cols[2].modules.empty();
+        bool right_has_3 = !app.module_cols[3].modules.empty();
+        int right_cols = (right_has_2 ? 1 : 0) + (right_has_3 ? 1 : 0);
+
+        auto compute_stack_drop = [&](int c) {
+            const auto& r = col_rects[c];
+            const auto& mrs = mod_rects[c];
+            app.drop_target_valid = true;
+            app.drop_target_col = c;
+            if (mrs.empty()) {
+                app.drop_target_row = 0;
+                app.drop_preview_rect = r;
+                return;
+            }
+            int row = static_cast<int>(mrs.size());
+            for (size_t i = 0; i < mrs.size(); ++i) {
+                float mid_y = (mrs[i].top + mrs[i].bottom) * 0.5f;
+                if (my < mid_y) {
+                    row = static_cast<int>(i);
+                    break;
+                }
+            }
+            app.drop_target_row = row;
+            float preview_h = std::min(90.0f, (r.bottom - r.top) / static_cast<float>(mrs.size() + 1));
+            if (row == 0) {
+                app.drop_preview_rect = D2D1::RectF(r.left + 3, r.top + 3, r.right - 3, r.top + preview_h);
+            } else if (row >= static_cast<int>(mrs.size())) {
+                app.drop_preview_rect = D2D1::RectF(r.left + 3, r.bottom - preview_h, r.right - 3, r.bottom - 3);
+            } else {
+                float sy = mrs[row].top;
+                app.drop_preview_rect = D2D1::RectF(r.left + 3, sy - preview_h * 0.5f, r.right - 3, sy + preview_h * 0.5f);
+            }
+        };
+
+        float center_mid_x = (center_zone.left + center_zone.right) * 0.5f;
+        if (mx < center_mid_x) {
+            // Left side drop logic (supports 0 -> 1 col, 1 -> 2 cols side-by-side, or stacking up to 4 high)
+            if (left_cols == 0) {
+                app.drop_target_valid = true;
+                app.drop_target_col = 0;
+                app.drop_target_row = 0;
+                app.drop_preview_rect = D2D1::RectF(12.0f, pane_top, 260.0f, pane_bottom);
+            } else if (left_cols == 1) {
+                int c = left_has_0 ? 0 : 1;
+                const auto& r = col_rects[c];
+                float edge_w = std::min(58.0f, (r.right - r.left) * 0.26f);
+                if (mx < r.left + edge_w) {
+                    // Drop as new Outer-Left column (2-wide on Left!)
+                    app.drop_target_valid = true;
+                    app.drop_target_col = 10;
+                    app.drop_target_row = 0;
+                    app.drop_preview_rect = D2D1::RectF(r.left, pane_top, (r.left + r.right) * 0.5f - 2.0f, pane_bottom);
+                } else if (mx > r.right - edge_w) {
+                    // Drop as new Inner-Left column (2-wide on Left!)
+                    app.drop_target_valid = true;
+                    app.drop_target_col = 11;
+                    app.drop_target_row = 0;
+                    app.drop_preview_rect = D2D1::RectF((r.left + r.right) * 0.5f + 2.0f, pane_top, r.right + 40.0f, pane_bottom);
+                } else {
+                    compute_stack_drop(c);
+                }
+            } else {
+                float split_x = col_rects[0].right + 3.0f;
+                compute_stack_drop(mx < split_x ? 0 : 1);
+            }
+        } else {
+            // Right side drop logic (supports 0 -> 1 col, 1 -> 2 cols side-by-side, or stacking up to 4 high)
+            if (right_cols == 0) {
+                app.drop_target_valid = true;
+                app.drop_target_col = 2;
+                app.drop_target_row = 0;
+                app.drop_preview_rect = D2D1::RectF(W - 260.0f, pane_top, W - 12.0f, pane_bottom);
+            } else if (right_cols == 1) {
+                int c = right_has_2 ? 2 : 3;
+                const auto& r = col_rects[c];
+                float edge_w = std::min(58.0f, (r.right - r.left) * 0.26f);
+                if (mx < r.left + edge_w) {
+                    // Drop as new Inner-Right column (2-wide on Right!)
+                    app.drop_target_valid = true;
+                    app.drop_target_col = 20;
+                    app.drop_target_row = 0;
+                    app.drop_preview_rect = D2D1::RectF(r.left - 40.0f, pane_top, (r.left + r.right) * 0.5f - 2.0f, pane_bottom);
+                } else if (mx > r.right - edge_w) {
+                    // Drop as new Outer-Right column (2-wide on Right!)
+                    app.drop_target_valid = true;
+                    app.drop_target_col = 21;
+                    app.drop_target_row = 0;
+                    app.drop_preview_rect = D2D1::RectF((r.left + r.right) * 0.5f + 2.0f, pane_top, r.right, pane_bottom);
+                } else {
+                    compute_stack_drop(c);
+                }
+            } else {
+                float split_x = col_rects[2].right + 3.0f;
+                compute_stack_drop(mx < split_x ? 2 : 3);
+            }
+        }
+
+        if (app.drop_target_valid) {
+            fill_round_rect(app.drop_preview_rect, 8.0f, hex_color(0x00E5FF, 0.22f));
+            draw_round_rect(app.drop_preview_rect, 8.0f, hex_color(0x00E5FF), 2.2f);
+            std::string drop_lbl = (app.drop_target_col >= 10)
+                                       ? "DROP HERE: NEW SIDE-BY-SIDE COLUMN"
+                                       : ("DROP HERE: STACK ROW " + std::to_string(app.drop_target_row + 1));
+            draw_text(drop_lbl, font_ui_bold, app.drop_preview_rect, hex_color(0x00E5FF), DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+
+        // Draw floating ghost badge following cursor
+        D2D1_RECT_F ghost = D2D1::RectF(mx - 110.0f, my - 16.0f, mx + 110.0f, my + 16.0f);
+        fill_round_rect(ghost, 7.0f, hex_color(0x0F172A, 0.92f));
+        draw_round_rect(ghost, 7.0f, hex_color(0x00E5FF), 1.8f);
+        draw_text(std::string("\xe2\xa0\xbf ") + MeshGuiApp::module_title(app.dragging_module),
+                  font_ui_bold, ghost, hex_color(0x00E5FF), DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+
+    void render_single_module(MeshGuiApp& app, int mod_id, float x, float y, float w, float h) {
+        switch (mod_id) {
+            case MOD_JOINED_CHANNELS: render_module_joined_channels(app, x, y, w, h); break;
+            case MOD_RAINBOW_SNIFFER: render_module_rainbow_sniffer(app, x, y, w, h); break;
+            case MOD_PUBLIC_MESH:     render_module_public_mesh(app, x, y, w, h);     break;
+            case MOD_HW_SLOTS:        render_module_hw_slots(app, x, y, w, h);        break;
+            default: break;
+        }
+    }
+
     // ========================================================================
-    // CHANNELS DOCK: Joined Channels + 256-Bucket Rainbow Sniffer
-    // Supports inner vertical resizing, swapping dock side, and closing
+    // MODULE 0: JOINED CHANNELS
     // ========================================================================
-    void render_channels_dock(MeshGuiApp& app, float x, float y, float w, float h, bool is_left_side) {
-        float joined_h = std::clamp(h * app.channels_split_ratio, 70.0f, h - 140.0f);
-        D2D1_RECT_F joined_card = D2D1::RectF(x, y, x + w, y + joined_h);
+    void render_module_joined_channels(MeshGuiApp& app, float x, float y, float w, float h) {
+        D2D1_RECT_F joined_card = D2D1::RectF(x, y, x + w, y + h);
         fill_round_rect(joined_card, 10.0f, hex_color(0x0F172A));
         draw_round_rect(joined_card, 10.0f, hex_color(0x1E293B), 1.2f);
 
-        draw_text("JOINED CHANNELS", font_small,
-                  D2D1::RectF(x + 14, y + 8, x + w - 60, y + 28), hex_color(0x94A3B8));
-
-        // Header controls: [⇄] Swap dock side, [✕] Close dock
-        D2D1_RECT_F swap_btn = D2D1::RectF(x + w - 52, y + 5, x + w - 30, y + 25);
-        bool swap_hov = pt_in_rect(app.mouse_pt, swap_btn);
-        fill_round_rect(swap_btn, 4.0f, swap_hov ? hex_color(0x38BDF8, 0.3f) : hex_color(0x162032));
-        draw_text("⇄", font_ui_bold, swap_btn, swap_hov ? hex_color(0x38BDF8) : hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
-        app.button_hits.push_back({swap_btn, BTN_SWAP_DOCKS, ""});
-
-        D2D1_RECT_F close_btn = D2D1::RectF(x + w - 26, y + 5, x + w - 6, y + 25);
-        bool close_hov = pt_in_rect(app.mouse_pt, close_btn);
-        fill_round_rect(close_btn, 4.0f, close_hov ? hex_color(0xEF4444, 0.35f) : hex_color(0x162032));
-        draw_text("✕", font_ui_bold, close_btn, close_hov ? hex_color(0xEF4444) : hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
-        app.button_hits.push_back({close_btn, BTN_CLOSE_CHANNELS, ""});
+        draw_module_drag_header(app, MOD_JOINED_CHANNELS, x, y, w, "JOINED CHANNELS", 0x94A3B8);
 
         float row_y = y + 32.0f;
         for (size_t i = 0; i < app.tabs.size() && (row_y + 30.0f) < joined_card.bottom - 6.0f; ++i) {
@@ -3834,31 +4251,24 @@ private:
             app.joined_hits.push_back({row_r, static_cast<int>(i), tab.name});
             row_y += 31.0f;
         }
+    }
 
-        // Horizontal Splitter between Joined Channels and Rainbow Sniffer
-        float split_y = y + joined_h;
-        float split_h = 8.0f;
-        app.channels_horiz_splitter_rect = D2D1::RectF(x, split_y, x + w, split_y + split_h);
-        bool hsplit_hov = pt_in_rect(app.mouse_pt, app.channels_horiz_splitter_rect) ||
-                          app.dragging_splitter == DraggingSplitter::ChannelsInnerHorizontal;
-        fill_round_rect(app.channels_horiz_splitter_rect, 2.0f, hsplit_hov ? hex_color(0x00E5FF, 0.45f) : hex_color(0x0B111E));
-        float cx_grip = x + w * 0.5f;
-        fill_round_rect(D2D1::RectF(cx_grip - 14, split_y + 3, cx_grip + 14, split_y + 5), 1.0f,
-                        hsplit_hov ? hex_color(0x00E5FF) : hex_color(0x334155));
-
-        // Bottom Card: 256-Bucket Rainbow Sniffer & Channel Discovery
-        float sniffer_y = split_y + split_h;
-        float sniffer_h = h - joined_h - split_h;
+    // ========================================================================
+    // MODULE 1: 256-BUCKET RAINBOW SNIFFER
+    // ========================================================================
+    void render_module_rainbow_sniffer(MeshGuiApp& app, float x, float y, float w, float h) {
+        float sniffer_y = y;
+        float sniffer_h = h;
         D2D1_RECT_F sniffer_card = D2D1::RectF(x, sniffer_y, x + w, sniffer_y + sniffer_h);
         app.sniffer_view_rect = sniffer_card;
         fill_round_rect(sniffer_card, 10.0f, hex_color(0x0F172A));
         draw_round_rect(sniffer_card, 10.0f, hex_color(0x1E293B), 1.2f);
-        draw_text("256-BUCKET RAINBOW SNIFFER", font_small,
-                  D2D1::RectF(x + 14, sniffer_y + 8, x + w - 14, sniffer_y + 26), hex_color(0x10B981));
+        draw_module_drag_header(app, MOD_RAINBOW_SNIFFER, x, sniffer_y, w, "256-BUCKET RAINBOW SNIFFER", 0x10B981);
 
         // Mode switcher pills: [Live Traffic] vs [All 303+ Tags]
-        D2D1_RECT_F mode_live_r = D2D1::RectF(x + 10, sniffer_y + 30, x + 142, sniffer_y + 54);
-        D2D1_RECT_F mode_all_r  = D2D1::RectF(x + 148, sniffer_y + 30, x + w - 10, sniffer_y + 54);
+        float half_w = (w - 26.0f) * 0.5f;
+        D2D1_RECT_F mode_live_r = D2D1::RectF(x + 10, sniffer_y + 30, x + 10 + half_w, sniffer_y + 54);
+        D2D1_RECT_F mode_all_r  = D2D1::RectF(x + 16 + half_w, sniffer_y + 30, x + w - 10, sniffer_y + 54);
 
         fill_round_rect(mode_live_r, 5.0f, !app.show_all_rainbow_in_sniffer ? hex_color(0x10B981, 0.22f) : hex_color(0x162032));
         draw_round_rect(mode_live_r, 5.0f, !app.show_all_rainbow_in_sniffer ? hex_color(0x10B981) : hex_color(0x26354D), 1.0f);
@@ -4326,41 +4736,26 @@ private:
     }
 
     // ========================================================================
-    // MESH DOCK: Public MeshCore System (Repeaters/Rooms/Nodes) + 8-Slot Matrix
-    // Supports inner vertical resizing, swapping dock side, and closing
+    // MODULE 2: PUBLIC MESH SYSTEM (Repeaters/Rooms/Nodes)
     // ========================================================================
-    void render_mesh_dock(MeshGuiApp& app, float x, float y, float w, float h, bool is_left_side) {
-        float stations_h = std::clamp(h * app.mesh_split_ratio, 80.0f, h - 110.0f);
-        D2D1_RECT_F st_card = D2D1::RectF(x, y, x + w, y + stations_h);
+    void render_module_public_mesh(MeshGuiApp& app, float x, float y, float w, float h) {
+        D2D1_RECT_F st_card = D2D1::RectF(x, y, x + w, y + h);
         app.nodes_view_rect = st_card;
         fill_round_rect(st_card, 10.0f, hex_color(0x0F172A));
         draw_round_rect(st_card, 10.0f, hex_color(0x1E293B), 1.2f);
 
-        // Header controls: [⇄] Swap dock side, [✕] Close dock
-        D2D1_RECT_F swap_btn = D2D1::RectF(x + w - 52, y + 5, x + w - 30, y + 25);
-        bool swap_hov = pt_in_rect(app.mouse_pt, swap_btn);
-        fill_round_rect(swap_btn, 4.0f, swap_hov ? hex_color(0x38BDF8, 0.3f) : hex_color(0x162032));
-        draw_text("⇄", font_ui_bold, swap_btn, swap_hov ? hex_color(0x38BDF8) : hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
-        app.button_hits.push_back({swap_btn, BTN_SWAP_DOCKS, ""});
-
-        D2D1_RECT_F close_btn = D2D1::RectF(x + w - 26, y + 5, x + w - 6, y + 25);
-        bool close_hov = pt_in_rect(app.mouse_pt, close_btn);
-        fill_round_rect(close_btn, 4.0f, close_hov ? hex_color(0xEF4444, 0.35f) : hex_color(0x162032));
-        draw_text("✕", font_ui_bold, close_btn, close_hov ? hex_color(0xEF4444) : hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
-        app.button_hits.push_back({close_btn, BTN_CLOSE_MESH, ""});
-
         const auto& active_tab = app.tabs[app.active_tab_idx];
         if (!app.mesh_nodes.empty()) {
-            draw_text("PUBLIC MESH SYSTEM (" + std::to_string(app.mesh_nodes.size()) + " NODES)", font_small,
-                      D2D1::RectF(x + 12, y + 6, x + w - 56, y + 24), hex_color(0x00E5FF));
+            draw_module_drag_header(app, MOD_PUBLIC_MESH, x, y, w,
+                                    "PUBLIC MESH SYSTEM (" + std::to_string(app.mesh_nodes.size()) + ")", 0x00E5FF);
 
             char count_buf[96];
             std::snprintf(count_buf, sizeof(count_buf), "%zu Repeaters | %zu Rooms | %zu Stations",
                           app.repeater_count, app.room_server_count, app.chat_node_count);
             draw_text(count_buf, font_mono_small,
-                      D2D1::RectF(x + 12, y + 22, x + w - 12, y + 38), hex_color(0x94A3B8));
+                      D2D1::RectF(x + 12, y + 24, x + w - 12, y + 40), hex_color(0x94A3B8));
 
-            float sy = y + 42.0f;
+            float sy = y + 44.0f;
             int idx = 0;
             for (const auto& nd : app.mesh_nodes) {
                 if (idx++ < app.nodes_scroll) continue;
@@ -4423,8 +4818,8 @@ private:
                 sy += 43.0f;
             }
         } else {
-            draw_text("HEARD STATIONS (" + std::to_string(active_tab.nicks.size()) + ")", font_small,
-                      D2D1::RectF(x + 14, y + 8, x + w - 56, y + 28), hex_color(0xF472B6));
+            draw_module_drag_header(app, MOD_PUBLIC_MESH, x, y, w,
+                                    "HEARD STATIONS (" + std::to_string(active_tab.nicks.size()) + ")", 0xF472B6);
 
             float sy = y + 32.0f;
             if (active_tab.nicks.empty()) {
@@ -4465,31 +4860,24 @@ private:
                 }
             }
         }
+    }
 
-        // Horizontal Splitter between Mesh Nodes and Radio Hardware Slots
-        float split_y = y + stations_h;
-        float split_h = 8.0f;
-        app.mesh_horiz_splitter_rect = D2D1::RectF(x, split_y, x + w, split_y + split_h);
-        bool hsplit_hov = pt_in_rect(app.mouse_pt, app.mesh_horiz_splitter_rect) ||
-                          app.dragging_splitter == DraggingSplitter::MeshInnerHorizontal;
-        fill_round_rect(app.mesh_horiz_splitter_rect, 2.0f, hsplit_hov ? hex_color(0x00E5FF, 0.45f) : hex_color(0x0B111E));
-        float cx_grip = x + w * 0.5f;
-        fill_round_rect(D2D1::RectF(cx_grip - 14, split_y + 3, cx_grip + 14, split_y + 5), 1.0f,
-                        hsplit_hov ? hex_color(0x00E5FF) : hex_color(0x334155));
-
-        // Bottom Half: 8-Slot Radio Hardware Key Matrix (Slot 0..7 LRU)
-        float slots_y = split_y + split_h;
-        float slots_h = h - stations_h - split_h;
+    // ========================================================================
+    // MODULE 3: RADIO HARDWARE SLOTS (0..7 LRU)
+    // ========================================================================
+    void render_module_hw_slots(MeshGuiApp& app, float x, float y, float w, float h) {
+        float slots_y = y;
+        float slots_h = h;
         D2D1_RECT_F slots_card = D2D1::RectF(x, slots_y, x + w, slots_y + slots_h);
         fill_round_rect(slots_card, 10.0f, hex_color(0x0F172A));
         draw_round_rect(slots_card, 10.0f, hex_color(0x1E293B), 1.2f);
 
-        draw_text("RADIO HARDWARE SLOTS (0..7 LRU)", font_small,
-                  D2D1::RectF(x + 14, slots_y + 8, x + w - 14, slots_y + 28), hex_color(0x38BDF8));
+        draw_module_drag_header(app, MOD_HW_SLOTS, x, slots_y, w, "RADIO HARDWARE SLOTS (0..7 LRU)", 0x38BDF8);
 
+        const auto& active_tab = app.tabs[app.active_tab_idx];
         float ky = slots_y + 32.0f;
-        float row_step = std::min(34.0f, (slots_h - 38.0f) / 8.0f);
-        for (size_t i = 0; i < NUM_HW_CHANNEL_SLOTS; ++i) {
+        float row_step = std::clamp((slots_h - 38.0f) / 8.0f, 18.0f, 34.0f);
+        for (size_t i = 0; i < NUM_HW_CHANNEL_SLOTS && (ky + row_step - 3.0f) <= slots_card.bottom - 4.0f; ++i) {
             const auto& slot = app.hw_slots.slots[i];
             D2D1_RECT_F kr = D2D1::RectF(x + 10, ky, x + w - 10, ky + row_step - 3.0f);
             bool occupied = !slot.channel_name.empty();
@@ -5502,20 +5890,27 @@ static void handle_left_click(HWND hwnd, POINT pt) {
                 case BTN_CLEAR_REPLY:
                     g_app->clear_reply_target();
                     break;
-                case BTN_TOGGLE_CHANNELS:
-                    g_app->channels_visible = !g_app->channels_visible;
+                case BTN_TOGGLE_THEME: {
+                    g_app->light_mode = !g_app->light_mode;
+                    g_app->map_style = g_app->light_mode ? 1 : 0;
+                    g_app->state_dirty = true;
+#ifdef _WIN32
+                    BOOL dark_title = g_app->light_mode ? FALSE : TRUE;
+                    DwmSetWindowAttribute(hwnd, 20, &dark_title, sizeof(dark_title));
+#elif defined(__APPLE__)
+                    if (hwnd && hwnd->ns_window) {
+                        id app_name = mac_ns_str(g_app->light_mode ? "NSAppearanceNameAqua" : "NSAppearanceNameDarkAqua");
+                        id appearance = mac_cls_send<id>("NSAppearance", sel_registerName("appearanceNamed:"), app_name);
+                        if (appearance) {
+                            mac_msg_send<void>(hwnd->ns_window, sel_registerName("setAppearance:"), appearance);
+                        }
+                    }
+#endif
                     break;
-                case BTN_TOGGLE_MESH:
-                    g_app->mesh_visible = !g_app->mesh_visible;
-                    break;
-                case BTN_SWAP_DOCKS:
-                    std::swap(g_app->channels_side, g_app->mesh_side);
-                    break;
-                case BTN_CLOSE_CHANNELS:
-                    g_app->channels_visible = false;
-                    break;
-                case BTN_CLOSE_MESH:
-                    g_app->mesh_visible = false;
+                }
+                case BTN_RESET_LAYOUT:
+                    g_app->init_default_module_layout();
+                    g_app->state_dirty = true;
                     break;
                 case BTN_VIEW_CHAT:      g_app->center_view = CenterView::Chat; break;
                 case BTN_VIEW_PACKETS:   g_app->center_view = CenterView::Packets; break;
@@ -5672,23 +6067,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_SETCURSOR:
             if (g_app && LOWORD(lParam) == HTCLIENT) {
-                if (D2DRenderer::pt_in_rect(g_app->mouse_pt, g_app->left_vert_splitter_rect) ||
-                    D2DRenderer::pt_in_rect(g_app->mouse_pt, g_app->right_vert_splitter_rect) ||
-                    g_app->dragging_splitter == DraggingSplitter::LeftVertical ||
-                    g_app->dragging_splitter == DraggingSplitter::RightVertical) {
+                if (g_app->dragging_splitter == DraggingSplitter::ColumnWidth) {
                     SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
                     return TRUE;
                 }
-                if (D2DRenderer::pt_in_rect(g_app->mouse_pt, g_app->channels_horiz_splitter_rect) ||
-                    D2DRenderer::pt_in_rect(g_app->mouse_pt, g_app->mesh_horiz_splitter_rect) ||
-                    g_app->dragging_splitter == DraggingSplitter::ChannelsInnerHorizontal ||
-                    g_app->dragging_splitter == DraggingSplitter::MeshInnerHorizontal) {
+                for (const auto& vs : g_app->vert_splitter_hits) {
+                    if (D2DRenderer::pt_in_rect(g_app->mouse_pt, vs.rect)) {
+                        SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+                        return TRUE;
+                    }
+                }
+                if (g_app->dragging_splitter == DraggingSplitter::ModuleHeight) {
                     SetCursor(LoadCursor(nullptr, IDC_SIZENS));
                     return TRUE;
                 }
-                if (g_app->map_dragging) {
+                for (const auto& hs : g_app->horiz_splitter_hits) {
+                    if (D2DRenderer::pt_in_rect(g_app->mouse_pt, hs.rect)) {
+                        SetCursor(LoadCursor(nullptr, IDC_SIZENS));
+                        return TRUE;
+                    }
+                }
+                if (g_app->module_drag_active || g_app->map_dragging) {
                     SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
                     return TRUE;
+                }
+                for (const auto& mh : g_app->module_header_hits) {
+                    if (D2DRenderer::pt_in_rect(g_app->mouse_pt, mh.rect)) {
+                        SetCursor(LoadCursor(nullptr, IDC_HAND));
+                        return TRUE;
+                    }
                 }
                 if (g_app->center_view == CenterView::Map) {
                     for (const auto& h : g_app->map_pin_hits) {
@@ -5714,25 +6121,39 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_app->mouse_pt.x = GET_X_LPARAM(lParam);
                 g_app->mouse_pt.y = GET_Y_LPARAM(lParam);
 
+                if (g_app->dragging_module >= 0 && !g_app->module_drag_active) {
+                    int dx = std::abs(g_app->mouse_pt.x - g_app->drag_start_mouse.x);
+                    int dy = std::abs(g_app->mouse_pt.y - g_app->drag_start_mouse.y);
+                    if (dx + dy >= 5) {
+                        g_app->module_drag_active = true;
+                    }
+                }
+
                 if (g_app->dragging_splitter != DraggingSplitter::None) {
                     RECT cr;
                     GetClientRect(hwnd, &cr);
-                    float total_w = static_cast<float>(cr.right - cr.left);
                     float total_h = static_cast<float>(cr.bottom - cr.top - 84);
                     if (total_h < 100.0f) total_h = 100.0f;
 
-                    if (g_app->dragging_splitter == DraggingSplitter::LeftVertical) {
+                    if (g_app->dragging_splitter == DraggingSplitter::ColumnWidth &&
+                        g_app->active_splitter_col >= 0 && g_app->active_splitter_col < 4) {
                         float delta = static_cast<float>(g_app->mouse_pt.x - g_app->drag_start_mouse.x);
-                        g_app->left_pane_width = std::clamp(g_app->drag_start_val + delta, 180.0f, total_w * 0.45f);
-                    } else if (g_app->dragging_splitter == DraggingSplitter::RightVertical) {
-                        float delta = static_cast<float>(g_app->drag_start_mouse.x - g_app->mouse_pt.x);
-                        g_app->right_pane_width = std::clamp(g_app->drag_start_val + delta, 180.0f, total_w * 0.45f);
-                    } else if (g_app->dragging_splitter == DraggingSplitter::ChannelsInnerHorizontal) {
-                        float delta_y = static_cast<float>(g_app->mouse_pt.y - g_app->drag_start_mouse.y);
-                        g_app->channels_split_ratio = std::clamp(g_app->drag_start_val + delta_y / total_h, 0.15f, 0.85f);
-                    } else if (g_app->dragging_splitter == DraggingSplitter::MeshInnerHorizontal) {
-                        float delta_y = static_cast<float>(g_app->mouse_pt.y - g_app->drag_start_mouse.y);
-                        g_app->mesh_split_ratio = std::clamp(g_app->drag_start_val + delta_y / total_h, 0.15f, 0.85f);
+                        if (g_app->active_splitter_invert) delta = -delta;
+                        g_app->module_cols[g_app->active_splitter_col].width =
+                            std::clamp(g_app->drag_start_val + delta, 190.0f, 520.0f);
+                        g_app->state_dirty = true;
+                    } else if (g_app->dragging_splitter == DraggingSplitter::ModuleHeight &&
+                               g_app->active_splitter_col >= 0 && g_app->active_splitter_col < 4) {
+                        auto& col = g_app->module_cols[g_app->active_splitter_col];
+                        int r = g_app->active_splitter_row;
+                        if (r >= 0 && r + 1 < static_cast<int>(col.weights.size())) {
+                            float delta_w = static_cast<float>(g_app->mouse_pt.y - g_app->drag_start_mouse.y) / total_h;
+                            float sum_pair = g_app->drag_start_val + g_app->drag_start_val2;
+                            float w0 = std::clamp(g_app->drag_start_val + delta_w, 0.12f, std::max(0.12f, sum_pair - 0.12f));
+                            col.weights[r] = w0;
+                            col.weights[r + 1] = std::max(0.12f, sum_pair - w0);
+                            g_app->state_dirty = true;
+                        }
                     }
                 }
                 if (g_app->map_dragging) {
@@ -5751,36 +6172,48 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_LBUTTONDOWN:
             if (g_app) {
                 POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-                if (D2DRenderer::pt_in_rect(pt, g_app->left_vert_splitter_rect)) {
-                    g_app->dragging_splitter = DraggingSplitter::LeftVertical;
-                    g_app->drag_start_mouse = pt;
-                    g_app->drag_start_val = g_app->left_pane_width;
-                    SetCapture(hwnd);
-                    return 0;
-                }
-                if (D2DRenderer::pt_in_rect(pt, g_app->right_vert_splitter_rect)) {
-                    g_app->dragging_splitter = DraggingSplitter::RightVertical;
-                    g_app->drag_start_mouse = pt;
-                    g_app->drag_start_val = g_app->right_pane_width;
-                    SetCapture(hwnd);
-                    return 0;
-                }
-                if (D2DRenderer::pt_in_rect(pt, g_app->channels_horiz_splitter_rect)) {
-                    g_app->dragging_splitter = DraggingSplitter::ChannelsInnerHorizontal;
-                    g_app->drag_start_mouse = pt;
-                    g_app->drag_start_val = g_app->channels_split_ratio;
-                    SetCapture(hwnd);
-                    return 0;
-                }
-                if (D2DRenderer::pt_in_rect(pt, g_app->mesh_horiz_splitter_rect)) {
-                    g_app->dragging_splitter = DraggingSplitter::MeshInnerHorizontal;
-                    g_app->drag_start_mouse = pt;
-                    g_app->drag_start_val = g_app->mesh_split_ratio;
-                    SetCapture(hwnd);
-                    return 0;
+                if (!g_app->serial_dropdown_open && !g_app->ble_dropdown_open) {
+                    for (const auto& vs : g_app->vert_splitter_hits) {
+                        if (D2DRenderer::pt_in_rect(pt, vs.rect)) {
+                            g_app->dragging_splitter = DraggingSplitter::ColumnWidth;
+                            g_app->active_splitter_col = vs.col_idx;
+                            g_app->active_splitter_invert = vs.invert_delta;
+                            g_app->drag_start_mouse = pt;
+                            g_app->drag_start_val = g_app->module_cols[vs.col_idx].width;
+                            SetCapture(hwnd);
+                            return 0;
+                        }
+                    }
+                    for (const auto& hs : g_app->horiz_splitter_hits) {
+                        if (D2DRenderer::pt_in_rect(pt, hs.rect)) {
+                            auto& col = g_app->module_cols[hs.col_idx];
+                            g_app->ensure_column_weights(col);
+                            if (hs.row_idx >= 0 && hs.row_idx + 1 < static_cast<int>(col.weights.size())) {
+                                g_app->dragging_splitter = DraggingSplitter::ModuleHeight;
+                                g_app->active_splitter_col = hs.col_idx;
+                                g_app->active_splitter_row = hs.row_idx;
+                                g_app->drag_start_mouse = pt;
+                                g_app->drag_start_val = col.weights[hs.row_idx];
+                                g_app->drag_start_val2 = col.weights[hs.row_idx + 1];
+                                SetCapture(hwnd);
+                                return 0;
+                            }
+                        }
+                    }
+                    for (const auto& mh : g_app->module_header_hits) {
+                        if (D2DRenderer::pt_in_rect(pt, mh.rect)) {
+                            g_app->dragging_module = mh.id;
+                            g_app->module_drag_active = false;
+                            g_app->drop_target_valid = false;
+                            g_app->drag_start_mouse = pt;
+                            SetCapture(hwnd);
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                            return 0;
+                        }
+                    }
                 }
                 // Live Map: pins select, empty space pans (buttons + info card fall through to normal clicks)
-                if (g_app->center_view == CenterView::Map && !g_app->serial_dropdown_open &&
+                if (g_app->center_view == CenterView::Map && !g_app->serial_dropdown_open && !g_app->ble_dropdown_open &&
                     D2DRenderer::pt_in_rect(pt, g_app->map_rect) &&
                     !D2DRenderer::pt_in_rect(pt, g_app->map_card_rect)) {
                     bool on_button = false;
@@ -5810,6 +6243,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_LBUTTONUP:
+            if (g_app && g_app->dragging_module >= 0) {
+                if (g_app->module_drag_active && g_app->drop_target_valid) {
+                    g_app->apply_module_drop(g_app->dragging_module, g_app->drop_target_col, g_app->drop_target_row);
+                }
+                g_app->dragging_module = -1;
+                g_app->module_drag_active = false;
+                g_app->drop_target_valid = false;
+                ReleaseCapture();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (g_app && g_app->map_dragging) {
                 g_app->map_dragging = false;
                 if (!g_app->map_drag_moved) g_app->map_selected_key.clear();
@@ -6009,7 +6453,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     HWND hwnd = CreateWindowExW(
         0,
         wc.lpszClassName,
-        L"MeshCore++ \u2014 Native C++20 Tactical Mesh IRC & 256-Bucket Hashtag Sniffer (Heltec V3 / SenseCAP T1000-E)",
+        L"MeshCore++",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         80, 60, 1460, 880,
         nullptr, nullptr, hInstance, nullptr);
@@ -6024,8 +6468,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hIconBig));
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hIconSmall));
 
-    // Enable Windows 11 Immersive Dark Titlebar (DWMWA_USE_IMMERSIVE_DARK_MODE = 20)
-    BOOL dark_mode = TRUE;
+    // Sync Windows 11 Titlebar theme (DWMWA_USE_IMMERSIVE_DARK_MODE = 20)
+    BOOL dark_mode = app.light_mode ? FALSE : TRUE;
     DwmSetWindowAttribute(hwnd, 20, &dark_mode, sizeof(dark_mode));
 
     ShowWindow(hwnd, SW_SHOWNORMAL);
@@ -6056,7 +6500,7 @@ static const char kEmbeddedMacInfoPlist[] =
     "<plist version=\"1.0\">\n"
     "<dict>\n"
     "  <key>CFBundleIdentifier</key>\n"
-    "  <string>io.meshcore.plusplus</string>\n"
+    "  <string>com.meshcore.plusplus</string>\n"
     "  <key>CFBundleName</key>\n"
     "  <string>MeshCore++</string>\n"
     "  <key>NSBluetoothAlwaysUsageDescription</key>\n"
@@ -6228,7 +6672,62 @@ static void mac_win_will_close(id, SEL, id) {
     msg_send<void>(app, sel_registerName("terminate:"), static_cast<id>(nullptr));
 }
 
-int main(int, char**) {
+// Ensures that on macOS Sonoma+ (both Intel x86_64 and Apple Silicon arm64), the running app bundle
+// or binary has a genuine native Apple `LC_CODE_SIGNATURE` generated by `/usr/bin/codesign` so that
+// `tccd` / `bluetoothd` honors the user's System Settings -> Privacy & Security -> Bluetooth toggle.
+static void mac_ensure_native_codesign(char** argv) {
+    if (std::getenv("MESHCORE_SIGNED_EXEC") != nullptr) return;
+
+    char exe_buf[4096]{};
+    uint32_t exe_sz = sizeof(exe_buf);
+    if (_NSGetExecutablePath(exe_buf, &exe_sz) != 0) return;
+
+    char real_buf[4096]{};
+    const char* exe_path = realpath(exe_buf, real_buf) ? real_buf : exe_buf;
+    std::filesystem::path ep(exe_path);
+
+    std::error_code ec;
+    auto fsize = std::filesystem::file_size(ep, ec);
+    if (ec) return;
+
+    std::filesystem::path data_dir = std::filesystem::path(from_wide(exe_dir()));
+    std::filesystem::create_directories(data_dir, ec);
+    std::filesystem::path marker = data_dir / (".codesigned_v4_" + std::to_string(fsize));
+    if (std::filesystem::exists(marker, ec)) return;
+
+    // Determine whether we are running inside MeshCore++.app/Contents/MacOS/MeshCore++
+    std::filesystem::path sign_target = ep;
+    if (ep.parent_path().filename() == "MacOS" &&
+        ep.parent_path().parent_path().filename() == "Contents" &&
+        ep.parent_path().parent_path().parent_path().extension() == ".app") {
+        sign_target = ep.parent_path().parent_path().parent_path();
+    }
+
+    std::string target_str = sign_target.string();
+    std::string cmd = "/usr/bin/xattr -cr \"" + target_str + "\" >/dev/null 2>&1; "
+                      "/usr/bin/codesign --force --deep --sign - \"" + target_str + "\" >/dev/null 2>&1; "
+                      "/usr/bin/tccutil reset Bluetooth com.meshcore.plusplus >/dev/null 2>&1; "
+                      "/usr/bin/tccutil reset Bluetooth io.meshcore.plusplus >/dev/null 2>&1";
+    std::system(cmd.c_str());
+
+    // Record the new post-codesign file size so subsequent launches start immediately without resetting TCC
+    auto new_fsize = std::filesystem::file_size(ep, ec);
+    {
+        std::ofstream mf(data_dir / (".codesigned_v4_" + std::to_string(new_fsize ? new_fsize : fsize)));
+        mf << "signed\n";
+    }
+    {
+        std::ofstream mf2(marker);
+        mf2 << "signed\n";
+    }
+
+    setenv("MESHCORE_SIGNED_EXEC", "1", 1);
+    execv(exe_path, argv);
+}
+
+int main(int, char** argv) {
+    mac_ensure_native_codesign(argv);
+
     MeshGuiApp app;
     D2DRenderer renderer;
     g_app = &app;
@@ -6260,14 +6759,13 @@ int main(int, char**) {
                              sel_registerName("initWithContentRect:styleMask:backing:defer:"),
                              frame, style_mask, static_cast<unsigned long>(2), static_cast<ObjcBool>(0));
 
-    msg_send<void>(window, sel_registerName("setTitle:"),
-                   ns_str("MeshCore++ \xe2\x80\x94 Native C++20 Tactical Mesh IRC & 256-Bucket Hashtag Sniffer (macOS Sonoma+)"));
+    msg_send<void>(window, sel_registerName("setTitle:"), ns_str("MeshCore++"));
     msg_send<void>(window, sel_registerName("setAcceptsMouseMovedEvents:"), static_cast<ObjcBool>(1));
 
-    id dark_appearance = cls_send<id>("NSAppearance", sel_registerName("appearanceNamed:"),
-                                      ns_str("NSAppearanceNameDarkAqua"));
-    if (dark_appearance) {
-        msg_send<void>(window, sel_registerName("setAppearance:"), dark_appearance);
+    id appearance = cls_send<id>("NSAppearance", sel_registerName("appearanceNamed:"),
+                                 ns_str(app.light_mode ? "NSAppearanceNameAqua" : "NSAppearanceNameDarkAqua"));
+    if (appearance) {
+        msg_send<void>(window, sel_registerName("setAppearance:"), appearance);
     }
 
     id view_alloc = msg_send<id>(reinterpret_cast<id>(view_cls), sel_registerName("alloc"));
@@ -6295,4 +6793,5 @@ int main(int, char**) {
     return 0;
 }
 #endif
+
 

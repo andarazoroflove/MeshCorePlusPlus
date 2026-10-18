@@ -761,7 +761,7 @@ public:
         if (idx < NUM_HW_CHANNEL_SLOTS && !slots[idx].channel_name.empty()) {
             return slots[idx].channel_name;
         }
-        return PUBLIC_CHANNEL_NAME;
+        return (idx == 0) ? PUBLIC_CHANNEL_NAME : ("#slot" + std::to_string(idx));
     }
 
     // Allocates or updates LRU slot 1..7 (or returns 0 for Public)
