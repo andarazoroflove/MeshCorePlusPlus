@@ -105,6 +105,15 @@ CGColorRef CGColorCreate(CGColorSpaceRef space, const CGFloat* components);
 void CGColorRelease(CGColorRef color);
 CGImageRef CGImageCreateWithImageInRect(CGImageRef image, CGRect rect);
 void CGImageRelease(CGImageRef image);
+size_t CGImageGetWidth(CGImageRef image);
+size_t CGImageGetHeight(CGImageRef image);
+CGContextRef CGBitmapContextCreate(void* data, size_t width, size_t height, size_t bitsPerComponent, size_t bytesPerRow, CGColorSpaceRef space, uint32_t bitmapInfo);
+CGImageRef CGBitmapContextCreateImage(CGContextRef context);
+void CGContextRelease(CGContextRef c);
+typedef int32_t CGInterpolationQuality;
+constexpr CGInterpolationQuality kCGInterpolationNone = 1;
+constexpr CGInterpolationQuality kCGInterpolationHigh = 3;
+void CGContextSetInterpolationQuality(CGContextRef c, CGInterpolationQuality quality);
 
 // CoreText ABI
 typedef const struct __CTFont* CTFontRef;
@@ -479,7 +488,10 @@ enum D2D1_ANTIALIAS_MODE {
 };
 enum D2D1_TEXT_ANTIALIAS_MODE { D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE = 0 };
 enum D2D1_DRAW_TEXT_OPTIONS { D2D1_DRAW_TEXT_OPTIONS_CLIP = 2 };
-enum D2D1_BITMAP_INTERPOLATION_MODE { D2D1_BITMAP_INTERPOLATION_MODE_LINEAR = 1 };
+enum D2D1_BITMAP_INTERPOLATION_MODE {
+    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR = 0,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR = 1
+};
 
 namespace D2D1 {
     inline D2D1_COLOR_F ColorF(float r, float g, float b, float a = 1.0f) { return {r, g, b, a}; }
@@ -657,7 +669,7 @@ public:
         CGContextRestoreGState(ctx);
     }
     void DrawBitmap(ID2D1Bitmap* bmp, const D2D1_RECT_F& dst, float opacity = 1.0f,
-                    D2D1_BITMAP_INTERPOLATION_MODE = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    D2D1_BITMAP_INTERPOLATION_MODE interp = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                     const D2D1_RECT_F* src = nullptr) {
         if (!ctx || !bmp || !bmp->image) return;
         CGImageRef img = bmp->image;
@@ -670,6 +682,8 @@ public:
         if (img) {
             CGContextSaveGState(ctx);
             CGContextSetAlpha(ctx, opacity);
+            CGContextSetInterpolationQuality(
+                ctx, (interp == D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR) ? kCGInterpolationNone : kCGInterpolationHigh);
             // Flip locally around the destination rect so CGImage renders upright inside a flipped NSView
             CGContextTranslateCTM(ctx, 0.0, dst.top + dst.bottom);
             CGContextScaleCTM(ctx, 1.0, -1.0);
