@@ -72,12 +72,12 @@
 Pre-built binaries are available on the [**GitHub Releases**](https://github.com/andarazoroflove/MeshCorePlusPlus/releases) page and in the [`releases/`](releases/) folder:
 
 ### Windows 10 / 11 (`x86_64`)
-- **Standalone Executable**: [`MeshCore++-Windows-GUI.exe`](https://github.com/andarazoroflove/MeshCorePlusPlus/releases/latest)
+- **Standalone Executable**: [`MeshCorePlusPlus-Windows-GUI.exe`](https://github.com/andarazoroflove/MeshCorePlusPlus/releases/download/v1.0.0/MeshCorePlusPlus-Windows-GUI.exe)
 - Zero external runtime dependencies — statically linked C++20 / Direct2D / DirectWrite / WinHTTP binary. Simply download and run.
 
 ### macOS Sonoma 14.0+ (`Universal Binary`: Apple Silicon `arm64` + Intel `x86_64`)
-- **macOS Application Bundle (`.zip`)**: [`MeshCore++-macOS-Sonoma.zip`](https://github.com/andarazoroflove/MeshCorePlusPlus/releases/latest)
-- **Standalone Universal Binary**: [`MeshCore++-macOS-Sonoma-Universal`](https://github.com/andarazoroflove/MeshCorePlusPlus/releases/latest)
+- **macOS Application Bundle (`.zip`)**: [`MeshCorePlusPlus-macOS-Sonoma.zip`](https://github.com/andarazoroflove/MeshCorePlusPlus/releases/download/v1.0.0/MeshCorePlusPlus-macOS-Sonoma.zip)
+- **Standalone Universal Binary**: [`MeshCorePlusPlus-macOS-Sonoma-Universal`](https://github.com/andarazoroflove/MeshCorePlusPlus/releases/download/v1.0.0/MeshCorePlusPlus-macOS-Sonoma-Universal)
 - **Connecting a SenseCAP T1000-E over Bluetooth on macOS**:
   1. Unzip `MeshCore++-macOS-Sonoma.zip` and launch `MeshCore++.app` (if Gatekeeper prompts on first launch, run `xattr -cr MeshCore++.app` or Right-Click $\to$ **Open**).
   2. Click **`BLE NUS v`** in the top toolbar and grant macOS Bluetooth permission when prompted.
