@@ -286,7 +286,11 @@ private:
     }
 };
 
-static TileFetcher g_tiles;
+static TileFetcher& get_tiles() {
+    static TileFetcher* s = new TileFetcher();
+    return *s;
+}
+#define g_tiles (get_tiles())
 
 // ============================================================================
 // UTF-8 <-> UTF-16 Conversion & Time Helpers
@@ -7269,7 +7273,10 @@ static void ios_view_on_tick(id self, SEL, id) {
     msg_send<void>(self, sel_registerName("setNeedsDisplay"));
 }
 
+static void ios_ensure_classes_registered();
+
 static void ios_setup_root_window(id window_scene) {
+    ios_ensure_classes_registered();
     ios_ensure_app_initialized();
     if (g_mac_win.ns_window && g_mac_win.ns_view) {
         if (window_scene) {
@@ -7296,8 +7303,7 @@ static void ios_setup_root_window(id window_scene) {
     if (window_scene) {
         window = msg_send<id>(win_alloc, sel_registerName("initWithWindowScene:"), window_scene);
         if (window) msg_send<void>(window, sel_registerName("setFrame:"), bounds);
-    }
-    if (!window) {
+    } else {
         window = msg_send<id>(win_alloc, sel_registerName("initWithFrame:"), bounds);
     }
     if (window) CFRetain(window);
@@ -7361,8 +7367,22 @@ static void ios_delegate_set_window(id, SEL, id win) {
     }
 }
 
-static ObjcBool ios_app_did_finish_launching(id, SEL, id, id) {
-    ios_setup_root_window(nullptr);
+static void ios_deferred_classic_window_check(id, SEL, id) {
+    // Fallback for older non-scene iOS runtimes if scene:willConnectToSession:options: was not invoked
+    if (!g_mac_win.ns_window) {
+        ios_setup_root_window(nullptr);
+    }
+}
+
+static ObjcBool ios_app_did_finish_launching(id self, SEL, id, id) {
+    ios_ensure_classes_registered();
+    ios_ensure_app_initialized();
+    // Schedule a 50ms check: on iOS 13-27+ with UIApplicationSceneManifest, scene:willConnectToSession:options:
+    // creates the UIWindow with the UIWindowScene immediately after didFinishLaunchingWithOptions returns.
+    // Creating a scene-less UIWindow inside didFinishLaunchingWithOptions on iOS 26/27 triggers a UIKit scene assertion!
+    cls_send<id>("NSTimer",
+                 sel_registerName("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+                 0.05, self, sel_registerName("onDeferredWindowCheck:"), static_cast<id>(nullptr), static_cast<ObjcBool>(0));
     return static_cast<ObjcBool>(1);
 }
 
@@ -7380,35 +7400,50 @@ static id ios_config_for_scene_session(id, SEL, id, id session, id) {
     return cfg;
 }
 
+static void ios_ensure_classes_registered() {
+    static bool s_registered = false;
+    if (s_registered) return;
+    s_registered = true;
+
+    Class ui_view = objc_getClass("UIView");
+    if (ui_view && !objc_getClass("MeshCoreIOSView")) {
+        Class view_cls = objc_allocateClassPair(ui_view, "MeshCoreIOSView", 0);
+        if (view_cls) {
+            class_addMethod(view_cls, sel_registerName("drawRect:"), reinterpret_cast<IMP>(ios_view_draw_rect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+            class_addMethod(view_cls, sel_registerName("touchesBegan:withEvent:"), reinterpret_cast<IMP>(ios_touches_began), "v@:@@");
+            class_addMethod(view_cls, sel_registerName("touchesMoved:withEvent:"), reinterpret_cast<IMP>(ios_touches_moved), "v@:@@");
+            class_addMethod(view_cls, sel_registerName("touchesEnded:withEvent:"), reinterpret_cast<IMP>(ios_touches_ended), "v@:@@");
+            class_addMethod(view_cls, sel_registerName("touchesCancelled:withEvent:"), reinterpret_cast<IMP>(ios_touches_ended), "v@:@@");
+            class_addMethod(view_cls, sel_registerName("onTextChanged:"), reinterpret_cast<IMP>(ios_on_text_changed), "v@:@");
+            class_addMethod(view_cls, sel_registerName("onTextReturn:"), reinterpret_cast<IMP>(ios_on_text_return), "v@:@");
+            class_addMethod(view_cls, sel_registerName("onTick:"), reinterpret_cast<IMP>(ios_view_on_tick), "v@:@");
+            objc_registerClassPair(view_cls);
+        }
+    }
+
+    if (!objc_getClass("MeshCoreIOSAppDelegate")) {
+        Class super_del = objc_getClass("UIResponder");
+        if (!super_del) super_del = objc_getClass("NSObject");
+        Class del_cls = objc_allocateClassPair(super_del, "MeshCoreIOSAppDelegate", 0);
+        if (del_cls) {
+            class_addMethod(del_cls, sel_registerName("window"), reinterpret_cast<IMP>(ios_delegate_get_window), "@@:");
+            class_addMethod(del_cls, sel_registerName("setWindow:"), reinterpret_cast<IMP>(ios_delegate_set_window), "v@:@");
+            class_addMethod(del_cls, sel_registerName("application:didFinishLaunchingWithOptions:"),
+                            reinterpret_cast<IMP>(ios_app_did_finish_launching), "B@:@@");
+            class_addMethod(del_cls, sel_registerName("onDeferredWindowCheck:"),
+                            reinterpret_cast<IMP>(ios_deferred_classic_window_check), "v@:@");
+            class_addMethod(del_cls, sel_registerName("application:configurationForConnectingSceneSession:options:"),
+                            reinterpret_cast<IMP>(ios_config_for_scene_session), "@@:@@@");
+            class_addMethod(del_cls, sel_registerName("scene:willConnectToSession:options:"),
+                            reinterpret_cast<IMP>(ios_scene_will_connect), "v@:@@@");
+            objc_registerClassPair(del_cls);
+        }
+    }
+}
+
+__attribute__((visibility("default")))
 int main(int argc, char** argv) {
-    Class view_cls = objc_allocateClassPair(objc_getClass("UIView"), "MeshCoreIOSView", 0);
-    if (view_cls) {
-        class_addMethod(view_cls, sel_registerName("drawRect:"), reinterpret_cast<IMP>(ios_view_draw_rect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
-        class_addMethod(view_cls, sel_registerName("touchesBegan:withEvent:"), reinterpret_cast<IMP>(ios_touches_began), "v@:@@");
-        class_addMethod(view_cls, sel_registerName("touchesMoved:withEvent:"), reinterpret_cast<IMP>(ios_touches_moved), "v@:@@");
-        class_addMethod(view_cls, sel_registerName("touchesEnded:withEvent:"), reinterpret_cast<IMP>(ios_touches_ended), "v@:@@");
-        class_addMethod(view_cls, sel_registerName("touchesCancelled:withEvent:"), reinterpret_cast<IMP>(ios_touches_ended), "v@:@@");
-        class_addMethod(view_cls, sel_registerName("onTextChanged:"), reinterpret_cast<IMP>(ios_on_text_changed), "v@:@");
-        class_addMethod(view_cls, sel_registerName("onTextReturn:"), reinterpret_cast<IMP>(ios_on_text_return), "v@:@");
-        class_addMethod(view_cls, sel_registerName("onTick:"), reinterpret_cast<IMP>(ios_view_on_tick), "v@:@");
-        objc_registerClassPair(view_cls);
-    }
-
-    Class super_del = objc_getClass("UIResponder");
-    if (!super_del) super_del = objc_getClass("NSObject");
-    Class del_cls = objc_allocateClassPair(super_del, "MeshCoreIOSAppDelegate", 0);
-    if (del_cls) {
-        class_addMethod(del_cls, sel_registerName("window"), reinterpret_cast<IMP>(ios_delegate_get_window), "@@:");
-        class_addMethod(del_cls, sel_registerName("setWindow:"), reinterpret_cast<IMP>(ios_delegate_set_window), "v@:@");
-        class_addMethod(del_cls, sel_registerName("application:didFinishLaunchingWithOptions:"),
-                        reinterpret_cast<IMP>(ios_app_did_finish_launching), "B@:@@");
-        class_addMethod(del_cls, sel_registerName("application:configurationForConnectingSceneSession:options:"),
-                        reinterpret_cast<IMP>(ios_config_for_scene_session), "@@:@@@");
-        class_addMethod(del_cls, sel_registerName("scene:willConnectToSession:options:"),
-                        reinterpret_cast<IMP>(ios_scene_will_connect), "v@:@@@");
-        objc_registerClassPair(del_cls);
-    }
-
+    ios_ensure_classes_registered();
     return UIApplicationMain(argc, argv, nullptr, ns_str("MeshCoreIOSAppDelegate"));
 }
 #else

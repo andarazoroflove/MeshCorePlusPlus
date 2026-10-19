@@ -222,7 +222,18 @@ struct MacBleState {
     bool devices_dirty = false;
 };
 
-inline MacBleState g_mac_ble;
+struct LazyMacBleState {
+    MacBleState* ptr() {
+        static MacBleState* s = new MacBleState();
+        return s;
+    }
+    MacBleState* operator->() { return ptr(); }
+};
+inline MacBleState& get_mac_ble() {
+    static MacBleState* s = new MacBleState();
+    return *s;
+}
+#define g_mac_ble (get_mac_ble())
 
 inline bool mac_ble_is_meshcore_name(const std::string& raw_name) {
     if (raw_name.empty()) return false;
