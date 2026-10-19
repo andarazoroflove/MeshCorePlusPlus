@@ -5,10 +5,12 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#ifndef MESHCORE_ANDROID_JNI
 #include <fstream>
 #include <iomanip>
-#include <optional>
 #include <sstream>
+#endif
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -283,12 +285,14 @@ private:
 // Helper Utilities & Key Derivation
 // ============================================================================
 inline std::string bytes_to_hex(const uint8_t* data, size_t len) {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.resize(len * 2);
     for (size_t i = 0; i < len; ++i) {
-        oss << std::setw(2) << static_cast<int>(data[i]);
+        out[i * 2]     = kHex[(data[i] >> 4) & 0x0Fu];
+        out[i * 2 + 1] = kHex[data[i] & 0x0Fu];
     }
-    return oss.str();
+    return out;
 }
 
 inline std::string psk_to_hex(const std::array<uint8_t, 16>& psk) {
@@ -888,7 +892,9 @@ public:
         for (int i = 0; i <= 99; ++i) {
             add_channel("#ch" + std::to_string(i));
         }
+#ifndef MESHCORE_ANDROID_JNI
         load_wordlist("wordlist.txt");
+#endif
     }
 
     ChannelCandidate add_channel(const std::string& raw_name) {
@@ -976,6 +982,7 @@ public:
         return list;
     }
 
+#ifndef MESHCORE_ANDROID_JNI
     void load_wordlist(const std::string& path) {
         std::ifstream f(path);
         if (!f.is_open()) return;
@@ -999,6 +1006,7 @@ public:
         }
         return cand;
     }
+#endif
 
     std::optional<SniffedGroupMessage> sniff_frame(const std::vector<uint8_t>& frame) const {
         // Direct raw 181-byte [0x49, 180_bytes] single-packet frame

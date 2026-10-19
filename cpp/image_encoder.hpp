@@ -19,8 +19,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#ifndef MESHCORE_ANDROID_JNI
 #include <filesystem>
 #include <fstream>
+#endif
 #include <string>
 #include <vector>
 
@@ -243,7 +245,7 @@ inline bool encode_rgba_to_mono_bitmap(const uint8_t* src_pixels,
     size_t dst_x0 = 0, dst_y0 = 0, dst_w = MONO_IMG_W, dst_h = MONO_IMG_H;
     if (cropped_aspect * MAX_ANAMORPHIC < TARGET_ASPECT) {
         dst_w = std::clamp<size_t>(
-            static_cast<size_t>(std::lround(static_cast<double>(MONO_IMG_H) * cropped_aspect * MAX_ANAMORPHIC)),
+            static_cast<size_t>(static_cast<double>(MONO_IMG_H) * cropped_aspect * MAX_ANAMORPHIC + 0.5),
             36u, MONO_IMG_W);
         dst_w &= ~1u; // Keep even width for clean 2x2 block alignment
         dst_x0 = (MONO_IMG_W - dst_w) / 2;
@@ -272,10 +274,10 @@ inline bool encode_rgba_to_mono_bitmap(const uint8_t* src_pixels,
             double sum_lum = 0.0;
             int count = 0;
 
-            const int ix0 = std::clamp(static_cast<int>(std::floor(sx0)), 0, src_w - 1);
-            const int ix1 = std::clamp(static_cast<int>(std::ceil(sx1)) - 1, ix0, src_w - 1);
-            const int iy0 = std::clamp(static_cast<int>(std::floor(sy0)), 0, src_h - 1);
-            const int iy1 = std::clamp(static_cast<int>(std::ceil(sy1)) - 1, iy0, src_h - 1);
+            const int ix0 = std::clamp(static_cast<int>(sx0), 0, src_w - 1);
+            const int ix1 = std::clamp(static_cast<int>(sx1 + 0.999999) - 1, ix0, src_w - 1);
+            const int iy0 = std::clamp(static_cast<int>(sy0), 0, src_h - 1);
+            const int iy1 = std::clamp(static_cast<int>(sy1 + 0.999999) - 1, iy0, src_h - 1);
 
             if ((ix1 - ix0 + 1) * (iy1 - iy0 + 1) > 16) {
                 const int stride_y = std::max(1, (iy1 - iy0 + 1) / 8);
@@ -297,7 +299,7 @@ inline bool encode_rgba_to_mono_bitmap(const uint8_t* src_pixels,
                 }
             }
 
-            const int avg = (count > 0) ? static_cast<int>(std::lround(sum_lum / static_cast<double>(count))) : 0;
+            const int avg = (count > 0) ? static_cast<int>(sum_lum / static_cast<double>(count) + 0.5) : 0;
             gray[(dst_y0 + dy) * MONO_IMG_W + (dst_x0 + dx)] = static_cast<uint8_t>(std::clamp(avg, 0, 255));
         }
     }
@@ -317,19 +319,20 @@ inline bool encode_rgba_to_mono_bitmap(const uint8_t* src_pixels,
     const int p97 = static_cast<int>(sorted[(active_cnt * 97) / 100]);
     const int span = p97 - p3;
 
-    // Compute adaptive midtone gamma so dark or bright images use the full 1-bit tonal range
-    double gamma = 1.0;
+    // Compute adaptive midtone balance parameter so dark or bright images use the full 1-bit tonal range
+    double mid_m = 0.5;
     if (span > 8) {
-        const double norm_mid = std::clamp(static_cast<double>(p50 - p3) / static_cast<double>(span), 0.12, 0.88);
-        gamma = std::clamp(std::log(0.5) / std::log(norm_mid), 0.72, 1.38);
+        mid_m = std::clamp(static_cast<double>(p50 - p3) / static_cast<double>(span), 0.32, 0.68);
     }
 
     float norm_buf[MONO_IMG_PIXELS];
     for (size_t i = 0; i < MONO_IMG_PIXELS; ++i) {
         if (span > 4) {
-            const double clamped = static_cast<double>(std::clamp(static_cast<int>(gray[i]), p3, p97) - p3) /
-                                   static_cast<double>(span);
-            norm_buf[i] = static_cast<float>(std::pow(clamped, gamma) * 255.0);
+            const double x = static_cast<double>(std::clamp(static_cast<int>(gray[i]), p3, p97) - p3) /
+                             static_cast<double>(span);
+            // Schlick rational midtone curve mapping 0->0, mid_m->0.5, 1->1 without libm pow/log
+            const double curved = ((1.0 - mid_m) * x) / (mid_m + (1.0 - 2.0 * mid_m) * x);
+            norm_buf[i] = static_cast<float>(curved * 255.0);
         } else {
             norm_buf[i] = static_cast<float>(gray[i]);
         }

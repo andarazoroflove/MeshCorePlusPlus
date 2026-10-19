@@ -970,13 +970,15 @@ public class MeshCoreActivity extends Activity {
             public void run() {
                 try {
                     int orientation = ExifInterface.ORIENTATION_NORMAL;
-                    try (InputStream exifIn = getContentResolver().openInputStream(uri)) {
-                        if (exifIn != null) {
-                            ExifInterface exif = new ExifInterface(exifIn);
-                            orientation = exif.getAttributeInt(
-                                    ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL);
-                        }
-                    } catch (Exception ignored) {}
+                    if (Build.VERSION.SDK_INT >= 24) {
+                        try (InputStream exifIn = getContentResolver().openInputStream(uri)) {
+                            if (exifIn != null) {
+                                ExifInterface exif = new ExifInterface(exifIn);
+                                orientation = exif.getAttributeInt(
+                                        ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL);
+                            }
+                        } catch (Throwable ignored) {}
+                    }
 
                     Bitmap bmp;
                     try (InputStream in = getContentResolver().openInputStream(uri)) {
@@ -1079,7 +1081,13 @@ public class MeshCoreActivity extends Activity {
     // ========================================================================
     // BLE NUS Scanner & Gatt Client
     // ========================================================================
+    private boolean servicesDiscoveryStarted = false;
+
     private void requestBlePermissionsIfNeeded() {
+        if (Build.VERSION.SDK_INT < 23) {
+            startBleScanAndAutoConnect();
+            return;
+        }
         List<String> needed = new ArrayList<>();
         if (Build.VERSION.SDK_INT >= 31) {
             if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
@@ -1207,9 +1215,14 @@ public class MeshCoreActivity extends Activity {
                 activeGatt.close();
                 activeGatt = null;
             }
+            servicesDiscoveryStarted = false;
             statusText = "Connecting BLE NUS -> " + name + "...";
             updateHeaderUi();
-            activeGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
+            if (Build.VERSION.SDK_INT >= 23) {
+                activeGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
+            } else {
+                activeGatt = device.connectGatt(this, false, gattCallback);
+            }
         } catch (SecurityException e) {
             statusText = "BLE Connect permission denied";
             updateHeaderUi();
@@ -1218,11 +1231,31 @@ public class MeshCoreActivity extends Activity {
 
     private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
         @Override
-        public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+        public void onConnectionStateChange(final BluetoothGatt gatt, int status, int newState) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                servicesDiscoveryStarted = false;
+                boolean mtuRequested = false;
                 try {
-                    gatt.requestMtu(247);
-                } catch (SecurityException ignored) {}
+                    mtuRequested = gatt.requestMtu(247);
+                } catch (Throwable ignored) {}
+                if (!mtuRequested) {
+                    servicesDiscoveryStarted = true;
+                    try {
+                        gatt.discoverServices();
+                    } catch (Throwable ignored) {}
+                } else {
+                    mainHandler.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (!servicesDiscoveryStarted && activeGatt == gatt) {
+                                servicesDiscoveryStarted = true;
+                                try {
+                                    gatt.discoverServices();
+                                } catch (Throwable ignored) {}
+                            }
+                        }
+                    }, 900);
+                }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 mainHandler.post(new Runnable() {
                     @Override
@@ -1240,10 +1273,15 @@ public class MeshCoreActivity extends Activity {
 
         @Override
         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
-            negotiatedMtu = Math.max(23, mtu);
-            try {
-                gatt.discoverServices();
-            } catch (SecurityException ignored) {}
+            if (status == BluetoothGatt.GATT_SUCCESS && mtu > 23) {
+                negotiatedMtu = mtu;
+            }
+            if (!servicesDiscoveryStarted) {
+                servicesDiscoveryStarted = true;
+                try {
+                    gatt.discoverServices();
+                } catch (SecurityException ignored) {}
+            }
         }
 
         @Override

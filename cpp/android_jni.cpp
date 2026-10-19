@@ -1,10 +1,10 @@
+#define MESHCORE_ANDROID_JNI 1
 #include <jni.h>
 #include <string>
 #include <vector>
 #include <array>
-#include <mutex>
-#include <sstream>
-#include <iomanip>
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <algorithm>
@@ -13,12 +13,49 @@
 #include "protocol.hpp"
 #include "image_encoder.hpp"
 
+// Android Bionic <-> Musl symbol compatibility shims (supports Android 5.0 API 21 .. Android 15+)
+#ifdef stderr
+#undef stderr
+#endif
+extern "C" {
+extern int* __errno(void);
+extern int posix_memalign(void** memptr, size_t alignment, size_t size);
+__attribute__((visibility("default"), weak)) int* __errno_location(void) {
+    return __errno();
+}
+__attribute__((visibility("default"), weak)) void* aligned_alloc(size_t alignment, size_t size) {
+    void* ptr = nullptr;
+    if (alignment < sizeof(void*)) alignment = sizeof(void*);
+    if (posix_memalign(&ptr, alignment, size) != 0) return nullptr;
+    return ptr;
+}
+__attribute__((visibility("default"), weak)) int dladdr(const void*, void*) { return 0; }
+__attribute__((visibility("default"), weak)) int dl_iterate_phdr(int (*)(void*, size_t, void*), void*) { return 0; }
+__attribute__((visibility("default"), weak)) FILE* const stderr = nullptr;
+}
+
 using namespace meshirc;
 
 namespace {
 
+struct SpinLock {
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
+    void lock() noexcept {
+        while (flag.test_and_set(std::memory_order_acquire)) {}
+    }
+    void unlock() noexcept {
+        flag.clear(std::memory_order_release);
+    }
+};
+
+struct SpinGuard {
+    SpinLock& lk;
+    explicit SpinGuard(SpinLock& l) noexcept : lk(l) { lk.lock(); }
+    ~SpinGuard() noexcept { lk.unlock(); }
+};
+
 struct AndroidMeshEngine {
-    std::mutex mtx;
+    SpinLock mtx;
     RainbowTable rainbow;
     HardwareSlotTable hw_slots;
     std::string callsign = "MobileOp";
@@ -34,12 +71,14 @@ struct AndroidMeshEngine {
 };
 
 static AndroidMeshEngine& engine() {
-    static AndroidMeshEngine inst;
-    return inst;
+    static AndroidMeshEngine* inst = new AndroidMeshEngine();
+    return *inst;
 }
 
+extern "C" long bionic_time_sym(long*) __asm__("time");
+
 static uint32_t current_epoch_u32() {
-    return static_cast<uint32_t>(std::time(nullptr));
+    return static_cast<uint32_t>(bionic_time_sym(nullptr));
 }
 
 static std::string jstr_to_utf8(JNIEnv* env, jstring jstr) {
@@ -77,7 +116,7 @@ extern "C" {
 JNIEXPORT jint JNICALL
 Java_com_meshcore_plusplus_MeshCoreActivity_nativeInit(JNIEnv* env, jobject /*thiz*/, jstring jCallsign) {
     auto& eng = engine();
-    std::lock_guard<std::mutex> lk(eng.mtx);
+    SpinGuard lk(eng.mtx);
     std::string cs = jstr_to_utf8(env, jCallsign);
     if (!cs.empty()) eng.callsign = cs;
     return static_cast<jint>(eng.rainbow.total_candidates());
@@ -86,13 +125,13 @@ Java_com_meshcore_plusplus_MeshCoreActivity_nativeInit(JNIEnv* env, jobject /*th
 JNIEXPORT jstring JNICALL
 Java_com_meshcore_plusplus_MeshCoreActivity_nativeAddRainbowChannel(JNIEnv* env, jobject /*thiz*/, jstring jChan) {
     auto& eng = engine();
-    std::lock_guard<std::mutex> lk(eng.mtx);
+    SpinGuard lk(eng.mtx);
     std::string name = jstr_to_utf8(env, jChan);
     auto cand = eng.rainbow.add_channel(name);
-    std::ostringstream oss;
-    oss << cand.name << "\t0x" << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
-        << static_cast<int>(cand.channel_hash) << "\t" << psk_to_hex(cand.psk);
-    return env->NewStringUTF(oss.str().c_str());
+    char hbuf[16];
+    std::snprintf(hbuf, sizeof(hbuf), "\t0x%02X\t", static_cast<unsigned>(cand.channel_hash));
+    std::string out = cand.name + hbuf + psk_to_hex(cand.psk);
+    return env->NewStringUTF(out.c_str());
 }
 
 JNIEXPORT jbyteArray JNICALL
@@ -124,7 +163,7 @@ Java_com_meshcore_plusplus_MeshCoreActivity_nativeBuildSelfAdvert(JNIEnv* env, j
 JNIEXPORT jbyteArray JNICALL
 Java_com_meshcore_plusplus_MeshCoreActivity_nativeSyncChannelSlot(JNIEnv* env, jobject /*thiz*/, jstring jChan) {
     auto& eng = engine();
-    std::lock_guard<std::mutex> lk(eng.mtx);
+    SpinGuard lk(eng.mtx);
     std::string ch = jstr_to_utf8(env, jChan);
     eng.rainbow.add_channel(ch);
     std::array<uint8_t, 16> psk{};
@@ -142,7 +181,7 @@ JNIEXPORT jobjectArray JNICALL
 Java_com_meshcore_plusplus_MeshCoreActivity_nativeBuildChannelTextFrames(
     JNIEnv* env, jobject /*thiz*/, jstring jChan, jstring jCallsign, jstring jText) {
     auto& eng = engine();
-    std::lock_guard<std::mutex> lk(eng.mtx);
+    SpinGuard lk(eng.mtx);
     std::string ch = jstr_to_utf8(env, jChan);
     std::string cs = jstr_to_utf8(env, jCallsign);
     std::string txt = jstr_to_utf8(env, jText);
@@ -202,7 +241,7 @@ Java_com_meshcore_plusplus_MeshCoreActivity_nativeEncodeAndBuildImageFrames(
     decode_mono_img_companion_wire(reinterpret_cast<const uint8_t*>(wire_str.data()), wire_str.size(), wire_bits);
 
     auto& eng = engine();
-    std::lock_guard<std::mutex> lk(eng.mtx);
+    SpinGuard lk(eng.mtx);
     std::string ch = jstr_to_utf8(env, jChan);
     std::array<uint8_t, 16> psk{};
     std::string evicted;
@@ -281,9 +320,10 @@ Java_com_meshcore_plusplus_MeshCoreActivity_nativeDecodeBleFrame(
     const DecodedRadioPacket& pkt = *opt_pkt;
 
     auto& eng = engine();
-    std::lock_guard<std::mutex> lk(eng.mtx);
+    SpinGuard lk(eng.mtx);
 
-    std::ostringstream oss;
+    std::string out;
+    char numbuf[128];
     switch (pkt.kind) {
         case RadioPacketKind::ChannelMsgRecv: {
             std::string ch = eng.hw_slots.channel_for_slot(pkt.slot_idx);
@@ -295,11 +335,11 @@ Java_com_meshcore_plusplus_MeshCoreActivity_nativeDecodeBleFrame(
                     eng.rainbow.add_channel(tag);
                 }
             }
-            oss << "CHAT\t" << clean_tab_field(ch) << "\t"
-                << clean_tab_field(pkt.sender) << "\t"
-                << clean_tab_field(pkt.text) << "\t"
-                << pkt.rssi << "\t" << std::fixed << std::setprecision(1) << pkt.snr << "\t"
-                << static_cast<int>(pkt.hops) << "\t" << img_hex;
+            std::snprintf(numbuf, sizeof(numbuf), "\t%d\t%.1f\t%d\t",
+                          pkt.rssi, static_cast<double>(pkt.snr), static_cast<int>(pkt.hops));
+            out = "CHAT\t" + clean_tab_field(ch) + "\t"
+                + clean_tab_field(pkt.sender) + "\t"
+                + clean_tab_field(pkt.text) + numbuf + img_hex;
             break;
         }
         case RadioPacketKind::RawSniffedGroupFrame: {
@@ -312,47 +352,49 @@ Java_com_meshcore_plusplus_MeshCoreActivity_nativeDecodeBleFrame(
                         eng.rainbow.add_channel(tag);
                     }
                 }
-                oss << "CHAT\t" << clean_tab_field(sn->channel_name) << "\t"
-                    << clean_tab_field(sn->sender) << "\t"
-                    << clean_tab_field(sn->text) << "\t"
-                    << pkt.rssi << "\t" << std::fixed << std::setprecision(1) << pkt.snr << "\t"
-                    << static_cast<int>(pkt.hops) << "\t" << img_hex;
+                std::snprintf(numbuf, sizeof(numbuf), "\t%d\t%.1f\t%d\t",
+                              pkt.rssi, static_cast<double>(pkt.snr), static_cast<int>(pkt.hops));
+                out = "CHAT\t" + clean_tab_field(sn->channel_name) + "\t"
+                    + clean_tab_field(sn->sender) + "\t"
+                    + clean_tab_field(sn->text) + numbuf + img_hex;
             }
             break;
         }
         case RadioPacketKind::DirectMsgRecv: {
             std::string khex = bytes_to_hex(pkt.pub_key.data(), 6);
-            oss << "CHAT\t@" << khex << "\t"
-                << khex << "\t"
-                << clean_tab_field(pkt.text) << "\t"
-                << pkt.rssi << "\t" << std::fixed << std::setprecision(1) << pkt.snr << "\t"
-                << static_cast<int>(pkt.hops) << "\t";
+            std::snprintf(numbuf, sizeof(numbuf), "\t%d\t%.1f\t%d\t",
+                          pkt.rssi, static_cast<double>(pkt.snr), static_cast<int>(pkt.hops));
+            out = "CHAT\t@" + khex + "\t" + khex + "\t" + clean_tab_field(pkt.text) + numbuf;
             break;
         }
         case RadioPacketKind::LiveAdvert:
         case RadioPacketKind::ContactInfo: {
             std::string khex = bytes_to_hex(pkt.pub_key.data(), 6);
             std::string nm = pkt.node_name.empty() ? khex : pkt.node_name;
-            oss << "NODE\t" << clean_tab_field(nm) << "\t" << khex << "\t"
-                << static_cast<int>(pkt.contact_type) << "\t"
-                << static_cast<int>(pkt.hops) << "\t"
-                << pkt.rssi << "\t" << std::fixed << std::setprecision(1) << pkt.snr << "\t"
-                << pkt.lat_e6 << "\t" << pkt.lon_e6;
+            std::snprintf(numbuf, sizeof(numbuf), "\t%d\t%d\t%d\t%.1f\t%d\t%d",
+                          static_cast<int>(pkt.contact_type),
+                          static_cast<int>(pkt.hops),
+                          pkt.rssi, static_cast<double>(pkt.snr),
+                          pkt.lat_e6, pkt.lon_e6);
+            out = "NODE\t" + clean_tab_field(nm) + "\t" + khex + numbuf;
             break;
         }
         case RadioPacketKind::SelfInfo: {
-            oss << "SELF\t" << clean_tab_field(pkt.node_name) << "\t"
-                << pkt.freq_khz << "\t" << pkt.bw_hz << "\t"
-                << static_cast<int>(pkt.sf) << "\t" << static_cast<int>(pkt.cr) << "\t"
-                << static_cast<int>(pkt.tx_power_dbm);
+            std::snprintf(numbuf, sizeof(numbuf), "\t%u\t%u\t%d\t%d\t%d",
+                          pkt.freq_khz, pkt.bw_hz,
+                          static_cast<int>(pkt.sf), static_cast<int>(pkt.cr),
+                          static_cast<int>(pkt.tx_power_dbm));
+            out = "SELF\t" + clean_tab_field(pkt.node_name) + numbuf;
             break;
         }
         case RadioPacketKind::DeviceInfo: {
-            oss << "DEVICE\t" << clean_tab_field(pkt.model) << "\t" << clean_tab_field(pkt.firmware);
+            out = "DEVICE\t" + clean_tab_field(pkt.model) + "\t" + clean_tab_field(pkt.firmware);
             break;
         }
         case RadioPacketKind::Battery: {
-            oss << "BATTERY\t" << pkt.battery_mv << "\t" << static_cast<int>(pkt.battery_pct);
+            std::snprintf(numbuf, sizeof(numbuf), "BATTERY\t%u\t%d",
+                          pkt.battery_mv, static_cast<int>(pkt.battery_pct));
+            out = numbuf;
             break;
         }
         case RadioPacketKind::ChannelInfo: {
@@ -362,13 +404,14 @@ Java_com_meshcore_plusplus_MeshCoreActivity_nativeDecodeBleFrame(
                     eng.rainbow.add_channel(pkt.channel_name);
                 }
             }
-            oss << "SLOT\t" << static_cast<int>(pkt.slot_idx) << "\t" << clean_tab_field(pkt.channel_name);
+            std::snprintf(numbuf, sizeof(numbuf), "SLOT\t%d\t", static_cast<int>(pkt.slot_idx));
+            out = std::string(numbuf) + clean_tab_field(pkt.channel_name);
             break;
         }
         default:
             break;
     }
-    return env->NewStringUTF(oss.str().c_str());
+    return env->NewStringUTF(out.c_str());
 }
 
 } // extern "C"
