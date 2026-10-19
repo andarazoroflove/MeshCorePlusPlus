@@ -155,7 +155,7 @@ inline std::vector<DetectedSerialPort> detect_serial_ports() {
             RegCloseKey(hKey);
         }
     }
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && !defined(MESHCORE_IOS)
     if (DIR* d = opendir("/dev")) {
         while (struct dirent* ent = readdir(d)) {
             std::string name(ent->d_name);
@@ -1403,12 +1403,15 @@ private:
                     g_mac_ble.central = nullptr;
                 }
             }
+            if (!g_mac_ble.queue) {
+                g_mac_ble.queue = dispatch_queue_create("com.meshcore.ble", nullptr);
+            }
             if (!g_mac_ble.central) {
                 id cm_alloc = mac_cls_send<id>("CBCentralManager", sel_registerName("alloc"));
-                // Pass nullptr queue so CBCentralManager binds to the main AppKit runloop for macOS Sonoma TCC authorization callbacks
                 g_mac_ble.central = mac_msg_send<id>(cm_alloc,
                                                      sel_registerName("initWithDelegate:queue:"),
-                                                     g_mac_ble.delegate, static_cast<id>(nullptr));
+                                                     g_mac_ble.delegate,
+                                                     reinterpret_cast<id>(g_mac_ble.queue));
             } else {
                 // Central already exists and is PoweredOn (5): check cache or restart scan
                 bool connected_from_cache = false;
@@ -1586,7 +1589,8 @@ private:
                             id cm_alloc = mac_cls_send<id>("CBCentralManager", sel_registerName("alloc"));
                             g_mac_ble.central = mac_msg_send<id>(cm_alloc,
                                                                  sel_registerName("initWithDelegate:queue:"),
-                                                                 g_mac_ble.delegate, static_cast<id>(nullptr));
+                                                                 g_mac_ble.delegate,
+                                                                 reinterpret_cast<id>(g_mac_ble.queue));
                         } else if (st == 5 && g_mac_ble.connected && g_mac_ble.active_peripheral) {
                             // Verify peripheral hasn't silently dropped out of CBPeripheralStateConnected (2) while idle
                             long pst = mac_msg_send<long>(g_mac_ble.active_peripheral, sel_registerName("state"));

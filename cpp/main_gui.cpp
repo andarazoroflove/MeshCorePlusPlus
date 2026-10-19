@@ -7020,8 +7020,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     return 0;
 }
 #elif defined(__APPLE__)
+#ifndef MESHCORE_IOS
 // Embed Info.plist with NSBluetoothAlwaysUsageDescription directly into Mach-O (__TEXT,__info_plist)
-// so macOS Sonoma+ TCC allows CoreBluetooth both inside MeshCore++.app and as a standalone Universal binary.
+// on macOS only. (On iOS, embedding __TEXT,__info_plist causes amfid to reject Sideloadly/AltStore
+// re-signed bundles because the provisioning profile rewrites Info.plist's CFBundleIdentifier.)
 __attribute__((used, section("__TEXT,__info_plist")))
 static const char kEmbeddedMacInfoPlist[] =
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -7038,6 +7040,7 @@ static const char kEmbeddedMacInfoPlist[] =
     "  <string>MeshCore++ uses Bluetooth Low Energy (Nordic UART Service) to communicate with SenseCAP T1000-E and Heltec V3 LoRa mesh radios.</string>\n"
     "</dict>\n"
     "</plist>\n";
+#endif
 
 bool g_mac_cmd_down = false;
 static MacWindowState g_mac_win;
@@ -7058,10 +7061,25 @@ static id ns_str(const char* utf8) {
 #ifdef MESHCORE_IOS
 static id g_ios_tf = nullptr;
 static bool g_ios_keyboard_visible = false;
-static int g_ios_top_inset = 48;
+static int g_ios_top_inset = 54;
 static CGPoint g_ios_touch_start{0.0, 0.0};
 static CGFloat g_ios_last_drag_y = 0.0;
 static bool g_ios_dragging_scroll = false;
+static bool g_ios_ble_autostarted = false;
+
+static void ios_ensure_app_initialized() {
+    if (!g_app) {
+        g_app = new MeshGuiApp();
+    }
+    if (!g_renderer) {
+        g_renderer = new D2DRenderer();
+    }
+    g_ios_on_image_picked = [](const std::wstring& wpath) {
+        if (g_app && !wpath.empty()) {
+            g_app->attach_image_from_path(wpath);
+        }
+    };
+}
 
 static void ios_sync_tf_from_app() {
     if (!g_ios_tf || !g_app) return;
@@ -7083,11 +7101,12 @@ static CGPoint ios_touch_pt(id self, id touches, long* out_taps = nullptr) {
 }
 
 static void ios_view_draw_rect(id self, SEL, CGRect) {
+    ios_ensure_app_initialized();
     CGRect bounds = msg_send<CGRect>(self, sel_registerName("bounds"));
     int raw_w = static_cast<int>(bounds.size.width);
     int raw_h = static_cast<int>(bounds.size.height);
-    g_ios_top_inset = (raw_h > raw_w && raw_h >= 720) ? 48 : 24;
-    int bot_inset = g_ios_keyboard_visible ? 285 : ((raw_h > raw_w && raw_h >= 720) ? 20 : 0);
+    g_ios_top_inset = (raw_h > raw_w && raw_h >= 720) ? 54 : 24;
+    int bot_inset = g_ios_keyboard_visible ? 285 : ((raw_h > raw_w && raw_h >= 720) ? 24 : 0);
     int new_w = std::max(240, raw_w);
     int new_h = std::max(280, raw_h - g_ios_top_inset - bot_inset);
 
@@ -7240,37 +7259,68 @@ static void ios_on_text_return(id self, SEL, id sender) {
 }
 
 static void ios_view_on_tick(id self, SEL, id) {
+    if (!g_ios_ble_autostarted && g_app) {
+        g_ios_ble_autostarted = true;
+        g_app->connected_port = "BLE";
+        g_app->log_public_system("[iOS BLE] Scanning Bluetooth LE for SenseCAP T1000-E / Heltec V3 (NUS)...");
+        g_app->transport.connect_ble("");
+    }
     WndProc(&g_mac_win, WM_TIMER, 1, 0);
     msg_send<void>(self, sel_registerName("setNeedsDisplay"));
 }
 
-static ObjcBool ios_app_did_finish_launching(id, SEL, id, id) {
-    g_ios_on_image_picked = [](const std::wstring& wpath) {
-        if (g_app && !wpath.empty()) {
-            g_app->attach_image_from_path(wpath);
+static void ios_setup_root_window(id window_scene) {
+    ios_ensure_app_initialized();
+    if (g_mac_win.ns_window && g_mac_win.ns_view) {
+        if (window_scene) {
+            msg_send<void>(g_mac_win.ns_window, sel_registerName("setWindowScene:"), window_scene);
         }
-    };
+        msg_send<void>(g_mac_win.ns_window, sel_registerName("makeKeyAndVisible"));
+        return;
+    }
 
-    id screen = cls_send<id>("UIScreen", sel_registerName("mainScreen"));
-    CGRect bounds = screen ? msg_send<CGRect>(screen, sel_registerName("bounds"))
-                           : CGRectMake(0.0, 0.0, 393.0, 852.0);
+    CGRect bounds = CGRectMake(0.0, 0.0, 393.0, 852.0);
+    if (window_scene) {
+        id coord = msg_send<id>(window_scene, sel_registerName("coordinateSpace"));
+        if (coord) bounds = msg_send<CGRect>(coord, sel_registerName("bounds"));
+    } else {
+        id screen = cls_send<id>("UIScreen", sel_registerName("mainScreen"));
+        if (screen) bounds = msg_send<CGRect>(screen, sel_registerName("bounds"));
+    }
+    if (bounds.size.width < 200.0 || bounds.size.height < 200.0) {
+        bounds = CGRectMake(0.0, 0.0, 393.0, 852.0);
+    }
 
     id win_alloc = cls_send<id>("UIWindow", sel_registerName("alloc"));
-    id window = msg_send<id>(win_alloc, sel_registerName("initWithFrame:"), bounds);
+    id window = nullptr;
+    if (window_scene) {
+        window = msg_send<id>(win_alloc, sel_registerName("initWithWindowScene:"), window_scene);
+        if (window) msg_send<void>(window, sel_registerName("setFrame:"), bounds);
+    }
+    if (!window) {
+        window = msg_send<id>(win_alloc, sel_registerName("initWithFrame:"), bounds);
+    }
+    if (window) CFRetain(window);
 
     id vc_alloc = cls_send<id>("UIViewController", sel_registerName("alloc"));
     id vc = msg_send<id>(vc_alloc, sel_registerName("init"));
+    if (vc) CFRetain(vc);
 
     Class view_cls = objc_getClass("MeshCoreIOSView");
     id view_alloc = msg_send<id>(reinterpret_cast<id>(view_cls), sel_registerName("alloc"));
     id view = msg_send<id>(view_alloc, sel_registerName("initWithFrame:"), bounds);
-    // UIViewAutoresizingFlexibleWidth (2) | UIViewAutoresizingFlexibleHeight (16) = 18
-    msg_send<void>(view, sel_registerName("setAutoresizingMask:"), static_cast<unsigned long>(18));
+    if (view) {
+        CFRetain(view);
+        // UIViewAutoresizingFlexibleWidth (2) | UIViewAutoresizingFlexibleHeight (16) = 18
+        msg_send<void>(view, sel_registerName("setAutoresizingMask:"), static_cast<unsigned long>(18));
+        msg_send<void>(view, sel_registerName("setMultipleTouchEnabled:"), static_cast<ObjcBool>(1));
+    }
 
     // Off-screen UITextField to bridge native iOS keyboard events + Return key
     id tf_alloc = cls_send<id>("UITextField", sel_registerName("alloc"));
     g_ios_tf = msg_send<id>(tf_alloc, sel_registerName("initWithFrame:"), CGRectMake(-2000.0, -2000.0, 120.0, 32.0));
     if (g_ios_tf) {
+        CFRetain(g_ios_tf);
         // UIKeyboardAppearanceDark = 1, UIReturnKeySend = 7, UITextAutocorrectionTypeNo = 1
         msg_send<void>(g_ios_tf, sel_registerName("setKeyboardAppearance:"), static_cast<long>(1));
         msg_send<void>(g_ios_tf, sel_registerName("setReturnKeyType:"), static_cast<long>(7));
@@ -7283,49 +7333,81 @@ static ObjcBool ios_app_did_finish_launching(id, SEL, id, id) {
         msg_send<void>(view, sel_registerName("addSubview:"), g_ios_tf);
     }
 
-    msg_send<void>(vc, sel_registerName("setView:"), view);
-    msg_send<void>(window, sel_registerName("setRootViewController:"), vc);
-    msg_send<void>(window, sel_registerName("makeKeyAndVisible"));
-
+    g_mac_win.width = static_cast<int>(bounds.size.width);
+    g_mac_win.height = std::max(280, static_cast<int>(bounds.size.height) - g_ios_top_inset - 24);
     g_mac_win.ns_window = window;
     g_mac_win.ns_view = view;
     g_mac_win.ios_vc = vc;
+
+    msg_send<void>(vc, sel_registerName("setView:"), view);
+    msg_send<void>(window, sel_registerName("setRootViewController:"), vc);
+    msg_send<void>(window, sel_registerName("makeKeyAndVisible"));
 
     // 30 FPS UI + RF telemetry timer (33ms)
     cls_send<id>("NSTimer",
                  sel_registerName("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
                  0.033, view, sel_registerName("onTick:"), static_cast<id>(nullptr), static_cast<ObjcBool>(1));
+}
 
-    // Automatically begin BLE NUS scan on iOS launch
-    if (g_app) {
-        g_app->connected_port = "BLE";
-        g_app->log_public_system("[iOS BLE] Scanning Bluetooth LE for SenseCAP T1000-E / Heltec V3 (NUS)...");
-        g_app->transport.connect_ble("");
+static id ios_delegate_get_window(id, SEL) {
+    return g_mac_win.ns_window;
+}
+
+static void ios_delegate_set_window(id, SEL, id win) {
+    if (win && win != g_mac_win.ns_window) {
+        CFRetain(win);
+        if (g_mac_win.ns_window) CFRelease(g_mac_win.ns_window);
+        g_mac_win.ns_window = win;
     }
+}
+
+static ObjcBool ios_app_did_finish_launching(id, SEL, id, id) {
+    ios_setup_root_window(nullptr);
     return static_cast<ObjcBool>(1);
 }
 
+static void ios_scene_will_connect(id, SEL, id scene, id, id) {
+    ios_setup_root_window(scene);
+}
+
+static id ios_config_for_scene_session(id, SEL, id, id session, id) {
+    id role = session ? msg_send<id>(session, sel_registerName("role")) : ns_str("UIWindowSceneSessionRoleApplication");
+    id cfg_alloc = cls_send<id>("UISceneConfiguration", sel_registerName("alloc"));
+    id cfg = msg_send<id>(cfg_alloc, sel_registerName("initWithName:sessionRole:"), ns_str("Default Configuration"), role);
+    if (cfg) {
+        msg_send<void>(cfg, sel_registerName("setDelegateClass:"), reinterpret_cast<id>(objc_getClass("MeshCoreIOSAppDelegate")));
+    }
+    return cfg;
+}
+
 int main(int argc, char** argv) {
-    MeshGuiApp app;
-    D2DRenderer renderer;
-    g_app = &app;
-    g_renderer = &renderer;
-
     Class view_cls = objc_allocateClassPair(objc_getClass("UIView"), "MeshCoreIOSView", 0);
-    class_addMethod(view_cls, sel_registerName("drawRect:"), reinterpret_cast<IMP>(ios_view_draw_rect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
-    class_addMethod(view_cls, sel_registerName("touchesBegan:withEvent:"), reinterpret_cast<IMP>(ios_touches_began), "v@:@@");
-    class_addMethod(view_cls, sel_registerName("touchesMoved:withEvent:"), reinterpret_cast<IMP>(ios_touches_moved), "v@:@@");
-    class_addMethod(view_cls, sel_registerName("touchesEnded:withEvent:"), reinterpret_cast<IMP>(ios_touches_ended), "v@:@@");
-    class_addMethod(view_cls, sel_registerName("touchesCancelled:withEvent:"), reinterpret_cast<IMP>(ios_touches_ended), "v@:@@");
-    class_addMethod(view_cls, sel_registerName("onTextChanged:"), reinterpret_cast<IMP>(ios_on_text_changed), "v@:@");
-    class_addMethod(view_cls, sel_registerName("onTextReturn:"), reinterpret_cast<IMP>(ios_on_text_return), "v@:@");
-    class_addMethod(view_cls, sel_registerName("onTick:"), reinterpret_cast<IMP>(ios_view_on_tick), "v@:@");
-    objc_registerClassPair(view_cls);
+    if (view_cls) {
+        class_addMethod(view_cls, sel_registerName("drawRect:"), reinterpret_cast<IMP>(ios_view_draw_rect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        class_addMethod(view_cls, sel_registerName("touchesBegan:withEvent:"), reinterpret_cast<IMP>(ios_touches_began), "v@:@@");
+        class_addMethod(view_cls, sel_registerName("touchesMoved:withEvent:"), reinterpret_cast<IMP>(ios_touches_moved), "v@:@@");
+        class_addMethod(view_cls, sel_registerName("touchesEnded:withEvent:"), reinterpret_cast<IMP>(ios_touches_ended), "v@:@@");
+        class_addMethod(view_cls, sel_registerName("touchesCancelled:withEvent:"), reinterpret_cast<IMP>(ios_touches_ended), "v@:@@");
+        class_addMethod(view_cls, sel_registerName("onTextChanged:"), reinterpret_cast<IMP>(ios_on_text_changed), "v@:@");
+        class_addMethod(view_cls, sel_registerName("onTextReturn:"), reinterpret_cast<IMP>(ios_on_text_return), "v@:@");
+        class_addMethod(view_cls, sel_registerName("onTick:"), reinterpret_cast<IMP>(ios_view_on_tick), "v@:@");
+        objc_registerClassPair(view_cls);
+    }
 
-    Class del_cls = objc_allocateClassPair(objc_getClass("NSObject"), "MeshCoreIOSAppDelegate", 0);
-    class_addMethod(del_cls, sel_registerName("application:didFinishLaunchingWithOptions:"),
-                    reinterpret_cast<IMP>(ios_app_did_finish_launching), "B@:@@");
-    objc_registerClassPair(del_cls);
+    Class super_del = objc_getClass("UIResponder");
+    if (!super_del) super_del = objc_getClass("NSObject");
+    Class del_cls = objc_allocateClassPair(super_del, "MeshCoreIOSAppDelegate", 0);
+    if (del_cls) {
+        class_addMethod(del_cls, sel_registerName("window"), reinterpret_cast<IMP>(ios_delegate_get_window), "@@:");
+        class_addMethod(del_cls, sel_registerName("setWindow:"), reinterpret_cast<IMP>(ios_delegate_set_window), "v@:@");
+        class_addMethod(del_cls, sel_registerName("application:didFinishLaunchingWithOptions:"),
+                        reinterpret_cast<IMP>(ios_app_did_finish_launching), "B@:@@");
+        class_addMethod(del_cls, sel_registerName("application:configurationForConnectingSceneSession:options:"),
+                        reinterpret_cast<IMP>(ios_config_for_scene_session), "@@:@@@");
+        class_addMethod(del_cls, sel_registerName("scene:willConnectToSession:options:"),
+                        reinterpret_cast<IMP>(ios_scene_will_connect), "v@:@@@");
+        objc_registerClassPair(del_cls);
+    }
 
     return UIApplicationMain(argc, argv, nullptr, ns_str("MeshCoreIOSAppDelegate"));
 }

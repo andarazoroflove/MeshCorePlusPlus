@@ -395,16 +395,23 @@ inline std::wstring mac_utf8_to_wide(const std::string& s) {
     return out;
 }
 
-// Returns writable ~/Library/Application Support/MeshCore++/MeshCore++ path so we NEVER write inside a sealed .app bundle
+// Returns writable ~/Documents/MeshCore++ (iOS) or ~/Library/Application Support/MeshCore++ (macOS) path
 inline DWORD GetModuleFileNameW(void*, wchar_t* buf, DWORD cap) {
     std::string app_dir;
     if (const char* home = std::getenv("HOME")) {
+#ifdef MESHCORE_IOS
+        std::string doc_dir = std::string(home) + "/Documents";
+        app_dir = doc_dir + "/MeshCore++";
+        mkdir(doc_dir.c_str(), 0755);
+        mkdir(app_dir.c_str(), 0755);
+#else
         std::string lib_dir = std::string(home) + "/Library";
         std::string sup_dir = lib_dir + "/Application Support";
         app_dir = sup_dir + "/MeshCore++";
         mkdir(lib_dir.c_str(), 0755);
         mkdir(sup_dir.c_str(), 0755);
         mkdir(app_dir.c_str(), 0755);
+#endif
     } else {
         app_dir = "/tmp/MeshCore++";
         mkdir(app_dir.c_str(), 0755);
