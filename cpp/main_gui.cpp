@@ -7395,9 +7395,17 @@ static id ios_config_for_scene_session(id, SEL, id, id session, id) {
     id cfg_alloc = cls_send<id>("UISceneConfiguration", sel_registerName("alloc"));
     id cfg = msg_send<id>(cfg_alloc, sel_registerName("initWithName:sessionRole:"), ns_str("Default Configuration"), role);
     if (cfg) {
+        Class ws_cls = objc_getClass("UIWindowScene");
+        if (ws_cls) {
+            msg_send<void>(cfg, sel_registerName("setSceneClass:"), reinterpret_cast<id>(ws_cls));
+        }
         msg_send<void>(cfg, sel_registerName("setDelegateClass:"), reinterpret_cast<id>(objc_getClass("MeshCoreIOSAppDelegate")));
     }
     return cfg;
+}
+
+static ObjcBool ios_delegate_conforms_to_protocol(id, SEL, id) {
+    return static_cast<ObjcBool>(1);
 }
 
 static void ios_ensure_classes_registered() {
@@ -7426,6 +7434,14 @@ static void ios_ensure_classes_registered() {
         if (!super_del) super_del = objc_getClass("NSObject");
         Class del_cls = objc_allocateClassPair(super_del, "MeshCoreIOSAppDelegate", 0);
         if (del_cls) {
+            const char* protos[] = {"UIApplicationDelegate", "UIWindowSceneDelegate", "UISceneDelegate"};
+            for (const char* pname : protos) {
+                if (Protocol* p = objc_getProtocol(pname)) {
+                    class_addProtocol(del_cls, p);
+                }
+            }
+            class_addMethod(del_cls, sel_registerName("conformsToProtocol:"),
+                            reinterpret_cast<IMP>(ios_delegate_conforms_to_protocol), "B@:@");
             class_addMethod(del_cls, sel_registerName("window"), reinterpret_cast<IMP>(ios_delegate_get_window), "@@:");
             class_addMethod(del_cls, sel_registerName("setWindow:"), reinterpret_cast<IMP>(ios_delegate_set_window), "v@:@");
             class_addMethod(del_cls, sel_registerName("application:didFinishLaunchingWithOptions:"),

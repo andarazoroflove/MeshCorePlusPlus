@@ -24,8 +24,11 @@ void objc_msgSend_stret(void);
 #endif
 id objc_retain(id obj);
 void objc_release(id obj);
+typedef struct objc_protocol Protocol;
 Class objc_allocateClassPair(Class superclass, const char* name, size_t extraBytes);
 signed char class_addMethod(Class cls, SEL name, IMP imp, const char* types);
+Protocol* objc_getProtocol(const char* name);
+signed char class_addProtocol(Class cls, Protocol* protocol);
 void objc_registerClassPair(Class cls);
 
 // Dynamic loader & GCD ABI
