@@ -77,7 +77,7 @@ public class MeshCoreActivity extends Activity {
     private native int[] nativeUnpackMonoBitmapToArgb(byte[] mono180, boolean lightMode);
     private native String nativeDecodeBleFrame(byte[] rawFrame);
 
-    // Nordic UART Service (NUS) UUIDs used by SenseCAP T1000-E & Heltec V3 MeshCore Companion firmware
+    // Nordic UART Service (NUS) UUIDs used by MeshCore Companion firmware
     private static final UUID NUS_SERVICE_UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
     private static final UUID NUS_TX_CHAR_UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
     private static final UUID NUS_RX_CHAR_UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
@@ -97,8 +97,8 @@ public class MeshCoreActivity extends Activity {
     private BluetoothGattCharacteristic nusTxChar;
     private boolean bleConnected = false;
     private boolean bleScanning = false;
-    private String statusText = "DISCONNECTED - Tap [BLE Scan] to connect radio";
-    private String radioModel = "SenseCAP / Heltec V3";
+    private String statusText = "DISCONNECTED - Tap [BLE Scan] to connect node";
+    private String radioModel = "MeshCore Companion Node";
     private String radioParams = "910.525 MHz | SF7 | BW 62.5 kHz | CR 5";
     private int batteryMv = 0;
     private int batteryPct = 0;
@@ -1126,7 +1126,7 @@ public class MeshCoreActivity extends Activity {
         if (scanner == null) return;
 
         bleScanning = true;
-        statusText = "Scanning BLE NUS for SenseCAP T1000-E / Heltec V3...";
+        statusText = "Scanning BLE NUS for MeshCore Companion Nodes...";
         updateHeaderUi();
 
         ScanSettings settings = new ScanSettings.Builder()
@@ -1175,10 +1175,12 @@ public class MeshCoreActivity extends Activity {
             }
             if (name == null || name.isEmpty()) return;
 
-            String low = name.toLowerCase(Locale.US);
-            boolean isMeshCandidate = low.contains("meshcore") || low.contains("t1000")
-                    || low.contains("sensecap") || low.contains("heltec")
-                    || low.contains("rak") || low.contains("xiao") || low.contains("whisper");
+            String low = (name != null) ? name.toLowerCase(Locale.US) : "";
+            boolean isMeshCandidate = low.contains("meshcore") || low.contains("companion")
+                    || low.contains("t1000") || low.contains("sensecap") || low.contains("heltec")
+                    || low.contains("rak") || low.contains("xiao") || low.contains("whisper")
+                    || low.contains("lilygo") || low.contains("t-echo") || low.contains("t-deck")
+                    || low.contains("t-beam") || low.contains("lora");
             if (result.getScanRecord() != null && result.getScanRecord().getServiceUuids() != null) {
                 for (android.os.ParcelUuid pu : result.getScanRecord().getServiceUuids()) {
                     if (NUS_SERVICE_UUID.equals(pu.getUuid())) {
@@ -1187,10 +1189,11 @@ public class MeshCoreActivity extends Activity {
                     }
                 }
             }
-            if (!isMeshCandidate) return;
+            if ((name == null || name.isEmpty()) && !isMeshCandidate) return;
 
+            final boolean autoConnectCandidate = isMeshCandidate;
             final BleDeviceItem item = new BleDeviceItem();
-            item.name = name;
+            item.name = (name != null && !name.isEmpty()) ? name : ("MeshCore BLE (" + dev.getAddress() + ")");
             item.address = dev.getAddress();
             item.rssi = result.getRssi();
             item.device = dev;
@@ -1200,7 +1203,7 @@ public class MeshCoreActivity extends Activity {
                 public void run() {
                     discoveredBle.put(item.address, item);
                     if (activeMobileTab == 4) buildRadioTabView();
-                    if (!bleConnected) {
+                    if (!bleConnected && autoConnectCandidate) {
                         stopBleScan();
                         connectToBleDevice(item.device, item.name);
                     }

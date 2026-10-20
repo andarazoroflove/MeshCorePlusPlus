@@ -29,8 +29,8 @@
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>MeshCore++ uses Bluetooth Low Energy (Nordic UART Service) to scan and connect to SenseCAP T1000-E and Heltec V3 LoRa mesh radios.</string>
+    <string>MeshCore++ uses Bluetooth Low Energy (Nordic UART Service) to scan and connect to MeshCore Companion LoRa mesh nodes.</string>
     <key>NSBluetoothPeripheralUsageDescription</key>
-    <string>MeshCore++ uses Bluetooth Low Energy (Nordic UART Service) to communicate with SenseCAP T1000-E and Heltec V3 LoRa mesh radios.</string>
+    <string>MeshCore++ uses Bluetooth Low Energy (Nordic UART Service) to communicate with MeshCore Companion LoRa mesh nodes.</string>
 </dict>
 </plist>

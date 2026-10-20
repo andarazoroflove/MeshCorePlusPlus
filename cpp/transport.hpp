@@ -109,19 +109,27 @@ inline std::vector<DetectedSerialPort> detect_serial_ports() {
 
             if (combined.find("vid_10c4") != std::string::npos ||
                 combined.find("cp210") != std::string::npos ||
+                combined.find("ch340") != std::string::npos ||
+                combined.find("ch9102") != std::string::npos ||
+                combined.find("ftdi") != std::string::npos ||
                 combined.find("heltec") != std::string::npos) {
-                item.friendly_name = "Heltec V3 (CP2102 USB-UART) — " + fname;
+                item.friendly_name = "MeshCore USB-UART — " + fname;
                 item.is_meshcore_candidate = true;
             } else if (combined.find("vid_2886") != std::string::npos ||
                        combined.find("vid_1915") != std::string::npos ||
+                       combined.find("vid_239a") != std::string::npos ||
+                       combined.find("vid_2e8a") != std::string::npos ||
                        combined.find("t1000") != std::string::npos ||
                        combined.find("sensecap") != std::string::npos ||
                        combined.find("seeed") != std::string::npos ||
-                       combined.find("nrf52") != std::string::npos) {
-                item.friendly_name = "SenseCAP T1000-E (USB CDC-ACM) — " + fname;
+                       combined.find("rak") != std::string::npos ||
+                       combined.find("lilygo") != std::string::npos ||
+                       combined.find("nrf52") != std::string::npos ||
+                       combined.find("usb serial") != std::string::npos) {
+                item.friendly_name = "MeshCore USB CDC-ACM — " + fname;
                 item.is_meshcore_candidate = true;
             } else if (combined.find("vid_303a") != std::string::npos) {
-                item.friendly_name = "ESP32-S3 Native USB (Heltec V3) — " + fname;
+                item.friendly_name = "MeshCore Native USB — " + fname;
                 item.is_meshcore_candidate = true;
             }
 
@@ -168,10 +176,10 @@ inline std::vector<DetectedSerialPort> detect_serial_ports() {
             if (name.find("usbserial") != std::string::npos ||
                 name.find("SLAB_USBtoUART") != std::string::npos ||
                 name.find("wchusbserial") != std::string::npos) {
-                item.friendly_name = "Heltec V3 (CP2102 USB-UART) — " + full;
+                item.friendly_name = "MeshCore USB-UART — " + full;
                 item.is_meshcore_candidate = true;
             } else if (name.find("usbmodem") != std::string::npos) {
-                item.friendly_name = "SenseCAP T1000-E / ESP32-S3 (USB CDC-ACM) — " + full;
+                item.friendly_name = "MeshCore USB CDC-ACM — " + full;
                 item.is_meshcore_candidate = true;
             } else {
                 item.friendly_name = "macOS Serial (" + full + ")";
@@ -355,7 +363,7 @@ inline void mac_ble_handle_peripheral_locked(id central, id delegate, id periph,
             dev.is_meshcore_candidate = is_candidate;
             g_mac_ble.discovered.push_back(dev);
             g_mac_ble.logs.push_back("[BLE] Discovered: " + disp_name + " (" + std::to_string(dev.rssi) + " dBm)" +
-                                     (is_candidate ? " [MeshCore / SenseCAP T1000-E NUS ★]" : ""));
+                                     (is_candidate ? " [MeshCore NUS ★]" : ""));
         }
         std::sort(g_mac_ble.discovered.begin(), g_mac_ble.discovered.end(),
                   [](const DetectedBleDevice& a, const DetectedBleDevice& b) {
@@ -383,8 +391,8 @@ inline void mac_ble_did_update_state(id self, SEL, id central) {
     long state = mac_msg_send<long>(central, sel_registerName("state"));
     if (state == 5) { // CBManagerStatePoweredOn
         s_last_state = state;
-        g_mac_ble.logs.push_back("[BLE] CoreBluetooth Powered ON. Checking connected NUS devices & scanning for SenseCAP T1000-E...");
-        g_mac_ble.status_label = "BLE: Scanning for SenseCAP T1000-E / NUS...";
+        g_mac_ble.logs.push_back("[BLE] CoreBluetooth Powered ON. Checking connected NUS devices & scanning for MeshCore nodes...");
+        g_mac_ble.status_label = "BLE: Scanning for MeshCore NUS...";
         g_mac_ble.status_connected = false;
         g_mac_ble.status_dirty = true;
 
@@ -566,7 +574,7 @@ inline void mac_ble_did_update_notify(id, SEL, id, id characteristic, id error) 
         g_mac_ble.logs.push_back("[BLE] Notify subscription status: " + err_str + " (Complete macOS Bluetooth Pairing if prompted, default PIN: 123456)");
     } else {
         (void)characteristic;
-        g_mac_ble.logs.push_back("[BLE] NUS TX notifications enabled on SenseCAP T1000-E / MeshCore link!");
+        g_mac_ble.logs.push_back("[BLE] NUS TX notifications enabled on MeshCore Companion link!");
     }
     if (g_mac_ble.rx_char) {
         g_mac_ble.gatt_ready = true;
@@ -691,8 +699,8 @@ public:
                 }
             }
         } else {
-            push_log("[SERIAL] No COM ports detected! Plug in Heltec V3 (CP2102) or SenseCAP T1000-E (CDC-ACM), or enable RF Simulator.");
-            push_status("SERIAL: No COM Ports Found", false, false);
+            push_log("[SERIAL] No serial ports detected! Plug in a MeshCore Companion USB node or enable RF Simulator.");
+            push_status("SERIAL: No Serial Ports Found", false, false);
             return;
         }
 
@@ -1316,7 +1324,7 @@ private:
     void ble_loop(const std::string& requested_ble_id = "") {
 #ifdef _WIN32
         (void)requested_ble_id;
-        push_status("BLE: Scanning for NUS (T1000-E / Heltec V3)...", false, false);
+        push_status("BLE: Scanning for MeshCore NUS...", false, false);
         push_log("[BLE] Scanning Windows Bluetooth LE GATT interfaces for Nordic UART Service (6E400001-B5A3-F393-E0A9-E50E24DCCA9E)...");
 
         // Nordic UART Service UUID: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
@@ -1327,7 +1335,7 @@ private:
         HDEVINFO hDevInfo = SetupDiGetClassDevsA(&NUS_SERVICE_GUID, nullptr, nullptr,
                                                  DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
         if (hDevInfo == INVALID_HANDLE_VALUE) {
-            push_log("[BLE] No paired/active MeshCore NUS BLE peripherals found. Pair SenseCAP T1000-E or Heltec V3 in Windows Bluetooth settings or use USB Serial / RF Simulator.");
+            push_log("[BLE] No paired/active MeshCore NUS BLE peripherals found. Pair your MeshCore node in Windows Bluetooth settings or use USB Serial / RF Simulator.");
             push_status("DISCONNECTED (No BLE NUS Device)", false, false);
             return;
         }
@@ -1336,7 +1344,7 @@ private:
         ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
         if (!SetupDiEnumDeviceInterfaces(hDevInfo, nullptr, &NUS_SERVICE_GUID, 0, &ifData)) {
             SetupDiDestroyDeviceInfoList(hDevInfo);
-            push_log("[BLE] Scan completed: no active SenseCAP T1000-E or Heltec V3 NUS peripheral in range.");
+            push_log("[BLE] Scan completed: no active MeshCore NUS peripheral in range.");
             push_status("DISCONNECTED (BLE Scan Timeout)", false, false);
             return;
         }
@@ -1378,8 +1386,8 @@ private:
         }
         CloseHandle(hBle);
 #elif defined(__APPLE__)
-        push_status("BLE: Scanning CoreBluetooth for SenseCAP T1000-E...", false, false);
-        push_log("[BLE] Initializing macOS CoreBluetooth Central Manager for Nordic UART Service (6E400001-B5A3-F393-E0A9-E50E24DCCA9E)...");
+        push_status("BLE: Scanning CoreBluetooth for MeshCore NUS...", false, false);
+        push_log("[BLE] Initializing CoreBluetooth Central Manager for Nordic UART Service (6E400001-B5A3-F393-E0A9-E50E24DCCA9E)...");
 
         Class del_cls = mac_get_ble_delegate_class();
         if (!del_cls) {
@@ -1572,7 +1580,7 @@ private:
         auto last_bat_poll = std::chrono::steady_clock::now();
 
         auto send_full_ble_handshake = [&]() {
-            push_log("[BLE] Handshaking with SenseCAP T1000-E / MeshCore BLE Companion...");
+            push_log("[BLE] Handshaking with MeshCore BLE Companion node...");
             write_ble_raw(build_cmd_device_query(), 260);
             write_ble_raw(build_cmd_app_start("MeshCore++"), 260);
             write_ble_raw(build_cmd_get_bat(), 200);
@@ -1820,7 +1828,7 @@ private:
 
         // 1. Initial DeviceInfo, Battery, and Slot 0 ChannelInfo
         {
-            std::string model = "SenseCAP T1000-E + Heltec V3 Sim / v1.5.0-meshcore";
+            std::string model = "MeshCore Companion Sim / v1.7.0";
             std::vector<uint8_t> dev_p = {RESP_DEVICE_INFO};
             dev_p.insert(dev_p.end(), model.begin(), model.end());
             feed_wire_into_parser(wire_parser, dev_p);

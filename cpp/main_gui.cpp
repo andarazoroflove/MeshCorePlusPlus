@@ -6131,13 +6131,13 @@ private:
         fill_round_rect(menu, 8.0f, hex_color(0x0F172A));
         draw_round_rect(menu, 8.0f, hex_color(0x00E5FF), 1.6f);
 
-        draw_text("SELECT HELTEC V3 / T1000-E USB SERIAL PORT", font_small,
+        draw_text("SELECT MESHCORE USB SERIAL PORT", font_small,
                   D2D1::RectF(x + 12, y + 6, x + w - 12, y + 28), hex_color(0x00E5FF));
 
         float ry = y + 30.0f;
         D2D1_RECT_F auto_r = D2D1::RectF(x + 8, ry, x + w - 8, ry + row_h - 2);
         if (pt_in_rect(app.mouse_pt, auto_r)) fill_round_rect(auto_r, 5.0f, hex_color(0x1E293B));
-        draw_text("Auto-Detect Heltec V3 (CP2102) / SenseCAP T1000-E", font_ui_bold,
+        draw_text("Auto-Detect MeshCore Companion USB Serial", font_ui_bold,
                   D2D1::RectF(auto_r.left + 8, auto_r.top, auto_r.right - 8, auto_r.bottom), hex_color(0x10B981));
         app.serial_menu_hits.push_back({auto_r, 0, ""});
         ry += row_h;
@@ -6172,20 +6172,20 @@ private:
         fill_round_rect(menu, 8.0f, hex_color(0x0F172A));
         draw_round_rect(menu, 8.0f, hex_color(0x38BDF8), 1.6f);
 
-        draw_text("BLUETOOTH LE (NUS) — SENSECAP T1000-E / HELTEC V3 SCANNER", font_small,
+        draw_text("BLUETOOTH LE (NUS) — MESHCORE COMPANION SCANNER", font_small,
                   D2D1::RectF(x + 12, y + 6, x + w - 12, y + 28), hex_color(0x38BDF8));
 
         float ry = y + 30.0f;
         D2D1_RECT_F auto_r = D2D1::RectF(x + 8, ry, x + w - 8, ry + row_h - 2);
         if (pt_in_rect(app.mouse_pt, auto_r)) fill_round_rect(auto_r, 5.0f, hex_color(0x1E293B));
-        draw_text("⟳ Auto-Scan & Connect SenseCAP T1000-E / MeshCore NUS", font_ui_bold,
+        draw_text("⟳ Auto-Scan & Connect MeshCore BLE NUS Node", font_ui_bold,
                   D2D1::RectF(auto_r.left + 8, auto_r.top, auto_r.right - 8, auto_r.bottom), hex_color(0x10B981));
         app.ble_menu_hits.push_back({auto_r, 0, ""});
         ry += row_h;
 
         if (app.cached_ble_devices.empty()) {
             D2D1_RECT_F sr = D2D1::RectF(x + 8, ry, x + w - 8, ry + row_h - 2);
-            draw_text("Scanning Bluetooth LE... (Power on SenseCAP T1000-E)", font_ui,
+            draw_text("Scanning Bluetooth LE for MeshCore nodes...", font_ui,
                       D2D1::RectF(sr.left + 8, sr.top, sr.right - 8, sr.bottom), hex_color(0x94A3B8));
             ry += row_h;
         } else {
@@ -6264,7 +6264,7 @@ static void handle_left_click(HWND hwnd, POINT pt) {
                 std::string target_ble = hit.payload;
                 g_app->connected_port = "BLE";
                 g_app->log_public_system(target_ble.empty()
-                                             ? "[BLE] Scanning Bluetooth LE for SenseCAP T1000-E / Heltec V3 (NUS)..."
+                                             ? "[BLE] Scanning Bluetooth LE for MeshCore Companion nodes (NUS)..."
                                              : ("[BLE] Connecting to Bluetooth LE peripheral " + target_ble + "..."));
                 g_app->transport.connect_ble(target_ble);
                 return;
@@ -6358,7 +6358,7 @@ static void handle_left_click(HWND hwnd, POINT pt) {
                     g_app->ble_dropdown_open = !g_app->ble_dropdown_open;
                     if (!g_app->transport_connected || g_app->transport_label.find("BLE") == std::string::npos) {
                         g_app->connected_port = "BLE";
-                        g_app->log_public_system("[BLE] Scanning Bluetooth LE for SenseCAP T1000-E / Heltec V3 (NUS)...");
+                        g_app->log_public_system("[BLE] Scanning Bluetooth LE for MeshCore Companion nodes (NUS)...");
                         g_app->transport.connect_ble("");
                     }
                     break;
@@ -7039,9 +7039,9 @@ static const char kEmbeddedMacInfoPlist[] =
     "  <key>CFBundleName</key>\n"
     "  <string>MeshCore++</string>\n"
     "  <key>NSBluetoothAlwaysUsageDescription</key>\n"
-    "  <string>MeshCore++ uses Bluetooth Low Energy (Nordic UART Service) to scan and connect to SenseCAP T1000-E and Heltec V3 LoRa mesh radios.</string>\n"
+    "  <string>MeshCore++ uses Bluetooth Low Energy (Nordic UART Service) to scan and connect to MeshCore Companion LoRa mesh nodes.</string>\n"
     "  <key>NSBluetoothPeripheralUsageDescription</key>\n"
-    "  <string>MeshCore++ uses Bluetooth Low Energy (Nordic UART Service) to communicate with SenseCAP T1000-E and Heltec V3 LoRa mesh radios.</string>\n"
+    "  <string>MeshCore++ uses Bluetooth Low Energy (Nordic UART Service) to communicate with MeshCore Companion LoRa mesh nodes.</string>\n"
     "</dict>\n"
     "</plist>\n";
 #endif
@@ -7266,7 +7266,7 @@ static void ios_view_on_tick(id self, SEL, id) {
     if (!g_ios_ble_autostarted && g_app) {
         g_ios_ble_autostarted = true;
         g_app->connected_port = "BLE";
-        g_app->log_public_system("[iOS BLE] Scanning Bluetooth LE for SenseCAP T1000-E / Heltec V3 (NUS)...");
+        g_app->log_public_system("[iOS BLE] Scanning Bluetooth LE for MeshCore Companion nodes (NUS)...");
         g_app->transport.connect_ble("");
     }
     WndProc(&g_mac_win, WM_TIMER, 1, 0);
