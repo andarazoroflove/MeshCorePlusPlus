@@ -218,7 +218,9 @@ struct MacWindowState {
     bool needs_display = false;
 };
 
+inline id g_ios_root_vc = nullptr;
 inline void (*g_ios_on_image_picked)(const std::wstring&) = nullptr;
+inline void (*g_ios_on_image_bits_picked)(const uint8_t* bits180, const char* label, const char* err) = nullptr;
 
 using HWND = MacWindowState*;
 using HDC  = CGContextRef;

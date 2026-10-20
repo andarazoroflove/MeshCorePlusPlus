@@ -513,7 +513,8 @@ inline bool load_and_encode_image_file(const std::wstring& path,
     return true;
 
 #elif defined(__APPLE__)
-    std::ifstream f(std::filesystem::path(path), std::ios::binary);
+    std::string utf8_path = mac_wide_to_utf8(path);
+    std::ifstream f(utf8_path.c_str(), std::ios::binary);
     if (!f) {
         out_error = "Cannot open selected image file.";
         return false;
@@ -567,12 +568,25 @@ inline bool load_and_encode_image_file(const std::wstring& path,
         return false;
     }
 
-    int w = static_cast<int>(CGImageGetWidth(cg_img));
-    int h = static_cast<int>(CGImageGetHeight(cg_img));
-    if (w <= 0 || h <= 0) {
+    int raw_w = static_cast<int>(CGImageGetWidth(cg_img));
+    int raw_h = static_cast<int>(CGImageGetHeight(cg_img));
+    if (raw_w <= 0 || raw_h <= 0) {
         CGImageRelease(cg_img);
         out_error = "Image has invalid dimensions.";
         return false;
+    }
+
+    // Cap decoded bitmap dimensions to 384px max on the longest side to avoid huge allocations on 48MP photos
+    int w = raw_w;
+    int h = raw_h;
+    if (w > 384 || h > 384) {
+        if (w >= h) {
+            h = std::max(1, (h * 384) / w);
+            w = 384;
+        } else {
+            w = std::max(1, (w * 384) / h);
+            h = 384;
+        }
     }
 
     int stride = w * 4;
@@ -587,6 +601,7 @@ inline bool load_and_encode_image_file(const std::wstring& path,
         return false;
     }
 
+    CGContextSetInterpolationQuality(bmp_ctx, kCGInterpolationHigh);
     CGContextDrawImage(bmp_ctx, CGRectMake(0, 0, w, h), cg_img);
     CGContextRelease(bmp_ctx);
     CGImageRelease(cg_img);
@@ -606,32 +621,151 @@ inline bool load_and_encode_image_file(const std::wstring& path,
 }
 
 #ifdef MESHCORE_IOS
+inline ObjcBool ios_picker_conforms_to_protocol(id, SEL, id) {
+    return static_cast<ObjcBool>(1);
+}
+
 inline void ios_img_picker_did_finish(id, SEL, id picker, id info) {
     if (picker) {
         mac_msg_send<void>(picker, sel_registerName("dismissViewControllerAnimated:completion:"),
                            static_cast<ObjcBool>(1), static_cast<id>(nullptr));
     }
     if (!info) return;
+
     id ui_img = mac_msg_send<id>(info, sel_registerName("objectForKey:"),
                                  mac_ns_str("UIImagePickerControllerEditedImage"));
     if (!ui_img) {
         ui_img = mac_msg_send<id>(info, sel_registerName("objectForKey:"),
                                   mac_ns_str("UIImagePickerControllerOriginalImage"));
     }
-    if (!ui_img) return;
-    id png_data = UIImagePNGRepresentation(ui_img);
-    if (!png_data) return;
 
-    std::string dir = "/tmp";
-    if (const char* home = std::getenv("HOME")) {
-        dir = std::string(home) + "/Library/Application Support/MeshCore++";
-        mkdir(dir.c_str(), 0755);
+    // Map UIImageOrientation (0..7) -> EXIF Orientation (1..8)
+    int exif_orientation = 1;
+    if (ui_img) {
+        long ui_orient = mac_msg_send<long>(ui_img, sel_registerName("imageOrientation"));
+        static const int kUiToExif[8] = {1, 3, 8, 6, 2, 4, 5, 7};
+        if (ui_orient >= 0 && ui_orient < 8) {
+            exif_orientation = kUiToExif[ui_orient];
+        }
     }
-    std::string out_path = dir + "/ios_picked_image.png";
-    mac_msg_send<ObjcBool>(png_data, sel_registerName("writeToFile:atomically:"),
-                           mac_ns_str(out_path.c_str()), static_cast<ObjcBool>(1));
-    if (g_ios_on_image_picked) {
-        g_ios_on_image_picked(mac_utf8_to_wide(out_path));
+
+    CGImageRef cg_img = nullptr;
+    bool owns_cg_img = false;
+
+    if (ui_img) {
+        cg_img = mac_msg_send<CGImageRef>(ui_img, sel_registerName("CGImage"));
+        if (cg_img) {
+            CFRetain(cg_img);
+            owns_cg_img = true;
+        }
+    }
+
+    // Fallback 1: UIImagePNGRepresentation -> CGImageSource in memory
+    if (!cg_img && ui_img) {
+        id png_data = UIImagePNGRepresentation(ui_img);
+        if (png_data) {
+            const UInt8* bytes = mac_msg_send<const UInt8*>(png_data, sel_registerName("bytes"));
+            CFIndex len = mac_msg_send<CFIndex>(png_data, sel_registerName("length"));
+            if (bytes && len > 0) {
+                CFDataRef cf_data = CFDataCreate(nullptr, bytes, len);
+                if (cf_data) {
+                    CGImageSourceRef src = CGImageSourceCreateWithData(cf_data, nullptr);
+                    CFRelease(cf_data);
+                    if (src) {
+                        cg_img = CGImageSourceCreateImageAtIndex(src, 0, nullptr);
+                        CFRelease(src);
+                        if (cg_img) owns_cg_img = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback 2: UIImagePickerControllerImageURL -> NSData dataWithContentsOfURL:
+    if (!cg_img) {
+        id img_url = mac_msg_send<id>(info, sel_registerName("objectForKey:"),
+                                      mac_ns_str("UIImagePickerControllerImageURL"));
+        if (img_url) {
+            id url_data = mac_cls_send<id>("NSData", sel_registerName("dataWithContentsOfURL:"), img_url);
+            if (url_data) {
+                const UInt8* bytes = mac_msg_send<const UInt8*>(url_data, sel_registerName("bytes"));
+                CFIndex len = mac_msg_send<CFIndex>(url_data, sel_registerName("length"));
+                if (bytes && len > 0) {
+                    CFDataRef cf_data = CFDataCreate(nullptr, bytes, len);
+                    if (cf_data) {
+                        CGImageSourceRef src = CGImageSourceCreateWithData(cf_data, nullptr);
+                        CFRelease(cf_data);
+                        if (src) {
+                            cg_img = CGImageSourceCreateImageAtIndex(src, 0, nullptr);
+                            CFRelease(src);
+                            if (cg_img) owns_cg_img = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!cg_img) {
+        if (g_ios_on_image_bits_picked) {
+            g_ios_on_image_bits_picked(nullptr, nullptr, "Could not decode selected iOS photo.");
+        }
+        return;
+    }
+
+    int raw_w = static_cast<int>(CGImageGetWidth(cg_img));
+    int raw_h = static_cast<int>(CGImageGetHeight(cg_img));
+    if (raw_w <= 0 || raw_h <= 0) {
+        if (owns_cg_img) CGImageRelease(cg_img);
+        if (g_ios_on_image_bits_picked) {
+            g_ios_on_image_bits_picked(nullptr, nullptr, "Selected photo has invalid dimensions.");
+        }
+        return;
+    }
+
+    int w = raw_w;
+    int h = raw_h;
+    if (w > 384 || h > 384) {
+        if (w >= h) {
+            h = std::max(1, (h * 384) / w);
+            w = 384;
+        } else {
+            w = std::max(1, (w * 384) / h);
+            h = 384;
+        }
+    }
+
+    int stride = w * 4;
+    std::vector<uint8_t> rgba(static_cast<size_t>(stride) * static_cast<size_t>(h), 0);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef bmp_ctx = CGBitmapContextCreate(rgba.data(), static_cast<size_t>(w), static_cast<size_t>(h),
+                                                 8, static_cast<size_t>(stride), cs, 1u);
+    if (cs) CGColorSpaceRelease(cs);
+    if (!bmp_ctx) {
+        if (owns_cg_img) CGImageRelease(cg_img);
+        if (g_ios_on_image_bits_picked) {
+            g_ios_on_image_bits_picked(nullptr, nullptr, "Failed to allocate CoreGraphics bitmap context.");
+        }
+        return;
+    }
+
+    CGContextSetInterpolationQuality(bmp_ctx, kCGInterpolationHigh);
+    CGContextDrawImage(bmp_ctx, CGRectMake(0, 0, w, h), cg_img);
+    CGContextRelease(bmp_ctx);
+    if (owns_cg_img) CGImageRelease(cg_img);
+
+    apply_exif_orientation(rgba, w, h, stride, exif_orientation);
+
+    std::array<uint8_t, MONO_IMG_BYTES> bits{};
+    if (!encode_rgba_to_mono_bitmap(rgba.data(), w, h, stride, false, bits)) {
+        if (g_ios_on_image_bits_picked) {
+            g_ios_on_image_bits_picked(nullptr, nullptr, "Failed to dither selected photo to 48x30.");
+        }
+        return;
+    }
+
+    if (g_ios_on_image_bits_picked) {
+        g_ios_on_image_bits_picked(bits.data(), "ios_photo.png", nullptr);
     }
 }
 
@@ -665,19 +799,29 @@ inline std::wstring open_image_file_dialog(HWND hwnd) {
     }
     return L"";
 #elif defined(MESHCORE_IOS)
-    if (!hwnd || !hwnd->ios_vc) return L"";
+    id vc = (hwnd && hwnd->ios_vc) ? hwnd->ios_vc : g_ios_root_vc;
+    if (!vc) return L"";
+    while (id presented = mac_msg_send<id>(vc, sel_registerName("presentedViewController"))) {
+        vc = presented;
+    }
     static id s_delegate = nullptr;
     if (!s_delegate) {
         Class del_cls = objc_allocateClassPair(objc_getClass("NSObject"), "MeshCoreIOSImgPickerDelegate", 0);
         if (del_cls) {
+            class_addMethod(del_cls, sel_registerName("conformsToProtocol:"),
+                            reinterpret_cast<IMP>(ios_picker_conforms_to_protocol), "B@:@");
             class_addMethod(del_cls, sel_registerName("imagePickerController:didFinishPickingMediaWithInfo:"),
                             reinterpret_cast<IMP>(ios_img_picker_did_finish), "v@:@@");
             class_addMethod(del_cls, sel_registerName("imagePickerControllerDidCancel:"),
                             reinterpret_cast<IMP>(ios_img_picker_did_cancel), "v@:@");
+            if (Protocol* p1 = objc_getProtocol("UIImagePickerControllerDelegate")) class_addProtocol(del_cls, p1);
+            if (Protocol* p2 = objc_getProtocol("UINavigationControllerDelegate")) class_addProtocol(del_cls, p2);
+            if (Protocol* p3 = objc_getProtocol("NSObject")) class_addProtocol(del_cls, p3);
             objc_registerClassPair(del_cls);
             s_delegate = mac_msg_send<id>(
                 mac_msg_send<id>(reinterpret_cast<id>(del_cls), sel_registerName("alloc")),
                 sel_registerName("init"));
+            if (s_delegate) CFRetain(s_delegate);
         }
     }
     id picker = mac_msg_send<id>(
@@ -687,7 +831,7 @@ inline std::wstring open_image_file_dialog(HWND hwnd) {
         // UIImagePickerControllerSourceTypePhotoLibrary = 0
         mac_msg_send<void>(picker, sel_registerName("setSourceType:"), static_cast<long>(0));
         mac_msg_send<void>(picker, sel_registerName("setDelegate:"), s_delegate);
-        mac_msg_send<void>(hwnd->ios_vc, sel_registerName("presentViewController:animated:completion:"),
+        mac_msg_send<void>(vc, sel_registerName("presentViewController:animated:completion:"),
                            picker, static_cast<ObjcBool>(1), static_cast<id>(nullptr));
     }
     return L"";

@@ -3229,7 +3229,9 @@ public:
 
     void attach_image_from_path(const std::wstring& path_w) {
         if (path_w.empty()) return;
-        std::string fname = from_wide(std::filesystem::path(path_w).filename().wstring());
+        std::string utf8_p = from_wide(path_w);
+        size_t slash = utf8_p.find_last_of("/\\");
+        std::string fname = (slash == std::string::npos) ? utf8_p : utf8_p.substr(slash + 1);
         if (fname.empty()) fname = "image";
         // Run the conversion pipeline asynchronously on a background worker thread
         std::thread([this, path_w, fname]() {
@@ -3254,7 +3256,9 @@ public:
     void attach_image_from_picker(HWND hwnd) {
         std::wstring picked = open_image_file_dialog(hwnd);
         if (picked.empty()) return;
-        std::string fname = from_wide(std::filesystem::path(picked).filename().wstring());
+        std::string utf8_p = from_wide(picked);
+        size_t slash = utf8_p.find_last_of("/\\");
+        std::string fname = (slash == std::string::npos) ? utf8_p : utf8_p.substr(slash + 1);
         if (fname.empty()) fname = "image";
 
         std::array<uint8_t, MONO_IMG_BYTES> bits{};
@@ -5181,14 +5185,14 @@ private:
 
         std::string prompt = "[" + app.callsign + " @ " + active_tab.name + "] > ";
         std::string disp_input = app.chat_input.empty() && !chat_focused
-                                     ? (prompt + "Type message or attach 1-bit image (📎)...")
+                                     ? (prompt + "Type message or attach 1-bit image (+IMG)...")
                                      : (prompt + app.chat_input + (chat_focused ? "_" : ""));
         draw_text(disp_input, font_mono,
                   D2D1::RectF(input_r.left + 12, input_r.top, text_right, input_r.bottom),
                   app.chat_input.empty() && !chat_focused ? hex_color(0x64748B) : hex_color(0xF8FAFC));
         app.button_hits.push_back({D2D1::RectF(input_r.left, input_r.top, text_right, input_r.bottom), BTN_CHAT_INPUT_BOX, ""});
 
-        // [📎 IMG] Attach Image button next to the channel text input box
+        // [+IMG] Attach Image button next to the channel text input box
         D2D1_RECT_F attach_btn = D2D1::RectF(x + w - 202, y + h - 46, x + w - 132, y + h - 10);
         bool att_hov = pt_in_rect(app.mouse_pt, attach_btn);
         fill_round_rect(attach_btn, 7.0f, app.pending_image_ready ? hex_color(0x10B981, 0.28f)
@@ -5197,8 +5201,13 @@ private:
         draw_round_rect(attach_btn, 7.0f, app.pending_image_ready ? hex_color(0x10B981)
                                         : att_hov                 ? hex_color(0x00E5FF)
                                                                   : hex_color(0x334155), 1.4f);
+#ifdef __APPLE__
+        draw_text("[+IMG]", font_ui_bold, attach_btn,
+                  app.pending_image_ready ? hex_color(0x10B981) : hex_color(0x38BDF8), DWRITE_TEXT_ALIGNMENT_CENTER);
+#else
         draw_text("\xF0\x9F\x93\x8E IMG", font_ui_bold, attach_btn,
                   app.pending_image_ready ? hex_color(0x10B981) : hex_color(0x38BDF8), DWRITE_TEXT_ALIGNMENT_CENTER);
+#endif
         app.button_hits.push_back({attach_btn, BTN_ATTACH_IMAGE, ""});
 
         D2D1_RECT_F tx_btn = D2D1::RectF(x + w - 126, y + h - 46, x + w - 10, y + h - 10);
@@ -7083,6 +7092,22 @@ static void ios_ensure_app_initialized() {
             g_app->attach_image_from_path(wpath);
         }
     };
+    g_ios_on_image_bits_picked = [](const uint8_t* bits180, const char* label, const char* err) {
+        if (!g_app) return;
+        if (bits180) {
+            std::memcpy(g_app->pending_image_bits.data(), bits180, MONO_IMG_BYTES);
+            g_app->pending_image_name = label ? label : "ios_photo.png";
+            g_app->pending_image_ready = true;
+            g_app->log_console(std::string("[IMAGE ENCODER] Dithered '") + g_app->pending_image_name +
+                               "' -> 48x30 1-bit Floyd-Steinberg (180B payload / 181B opcode 0x49). Auto-transmitting...");
+            g_app->confirm_send_pending_image();
+        } else if (err) {
+            g_app->log_active_tab(std::string("[IMAGE ENCODER ERROR] ") + err);
+        }
+        if (g_mac_win.ns_view) {
+            msg_send<void>(g_mac_win.ns_view, sel_registerName("setNeedsDisplay"));
+        }
+    };
 }
 
 static void ios_sync_tf_from_app() {
@@ -7194,6 +7219,7 @@ static void ios_touches_ended(id self, SEL, id touches, id) {
     if (!g_ios_dragging_scroll) {
         bool hit_text_box = false;
         bool hit_tx_btn = false;
+        bool hit_attach_btn = false;
         if (g_app) {
             for (const auto& b : g_app->button_hits) {
                 if (D2DRenderer::pt_in_rect(win_pt, b.rect)) {
@@ -7202,10 +7228,17 @@ static void ios_touches_ended(id self, SEL, id touches, id) {
                         hit_text_box = true;
                     } else if (b.id == BTN_TRANSMIT_TX) {
                         hit_tx_btn = true;
+                    } else if (b.id == BTN_ATTACH_IMAGE) {
+                        hit_attach_btn = true;
                     }
                     break;
                 }
             }
+        }
+
+        if (hit_attach_btn && g_ios_keyboard_visible && g_ios_tf) {
+            g_ios_keyboard_visible = false;
+            msg_send<ObjcBool>(g_ios_tf, sel_registerName("resignFirstResponder"));
         }
 
         WndProc(&g_mac_win, WM_LBUTTONDOWN, 0, lp);
@@ -7344,6 +7377,7 @@ static void ios_setup_root_window(id window_scene) {
     g_mac_win.ns_window = window;
     g_mac_win.ns_view = view;
     g_mac_win.ios_vc = vc;
+    g_ios_root_vc = vc;
 
     msg_send<void>(vc, sel_registerName("setView:"), view);
     msg_send<void>(window, sel_registerName("setRootViewController:"), vc);
