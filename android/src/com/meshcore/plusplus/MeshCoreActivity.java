@@ -34,7 +34,9 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.Editable;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -211,6 +213,7 @@ public class MeshCoreActivity extends Activity {
         appendSystemMessage("Public", "MeshCore++ Tactical Mobile (Android C++20 JNI) initialized — "
                 + totalRainbowCandidates + " rainbow channels across 256 SHA-256 buckets.");
         appendSystemMessage("Public", "Tap [Img] next to composer to dither & auto-send a single-packet 48x30 1-bit bitmap (opcode 0x49).");
+        appendSystemMessage("Public", "Public ROOM USERS shows every station heard on the mesh. Double-tap any user in ROOM USERS to open a Direct Message (@user)!");
 
         BluetoothManager bm = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
         if (bm != null) btAdapter = bm.getAdapter();
@@ -430,8 +433,17 @@ public class MeshCoreActivity extends Activity {
             }
         }
         if ("Public".equalsIgnoreCase(activeChannel)) {
+            for (List<ChatMsgItem> allM : channelMessages.values()) {
+                for (int i = allM.size() - 1; i >= 0; --i) {
+                    ChatMsgItem m = allM.get(i);
+                    if (!m.isSystem && m.sender != null && !m.sender.isEmpty()
+                            && !m.sender.equalsIgnoreCase(callsign) && !roomNicks.containsKey(m.sender)) {
+                        roomNicks.put(m.sender, 1);
+                    }
+                }
+            }
             for (NodeItem nd : meshNodes.values()) {
-                if ((nd.type == 1 || nd.type == 3) && nd.name != null && !nd.name.isEmpty()
+                if (nd.name != null && !nd.name.isEmpty()
                         && !nd.name.equalsIgnoreCase(callsign) && !roomNicks.containsKey(nd.name)) {
                     roomNicks.put(nd.name, 0);
                 }
@@ -483,13 +495,27 @@ public class MeshCoreActivity extends Activity {
             nickCol.setOrientation(LinearLayout.VERTICAL);
             nickCol.setPadding(dp(6), dp(6), dp(6), dp(6));
 
-            TextView tvHdr = new TextView(this);
+            final TextView tvHdr = new TextView(this);
             tvHdr.setText("ROOM USERS (" + roomUserCount + ")");
             tvHdr.setTextColor(Color.parseColor("#00E5FF"));
             tvHdr.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
             tvHdr.setTypeface(Typeface.DEFAULT_BOLD);
-            tvHdr.setPadding(dp(4), dp(2), dp(4), dp(6));
+            tvHdr.setPadding(dp(4), dp(2), dp(4), dp(4));
             nickCol.addView(tvHdr);
+
+            // Search input box for ROOM USERS
+            final EditText etNickSearch = new EditText(this);
+            etNickSearch.setHint("Search users...");
+            etNickSearch.setHintTextColor(Color.parseColor("#64748B"));
+            etNickSearch.setTextColor(Color.parseColor("#E2E8F0"));
+            etNickSearch.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            etNickSearch.setSingleLine(true);
+            etNickSearch.setPadding(dp(6), dp(4), dp(6), dp(4));
+            etNickSearch.setBackground(roundBg(Color.parseColor("#0D1829"), Color.parseColor("#38BDF8"), dp(1), dp(6)));
+            LinearLayout.LayoutParams searchLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            searchLp.setMargins(0, 0, 0, dp(6));
+            nickCol.addView(etNickSearch, searchLp);
 
             // Row 0: Self ([YOU])
             TextView tvSelf = new TextView(this);
@@ -504,6 +530,8 @@ public class MeshCoreActivity extends Activity {
             slp.setMargins(0, 0, 0, dp(4));
             nickCol.addView(tvSelf, slp);
 
+            final List<TextView> userViews = new ArrayList<>();
+            final List<String> userNames = new ArrayList<>();
             for (Map.Entry<String, Integer> entry : roomNicks.entrySet()) {
                 final String uName = entry.getKey();
                 final int mCnt = entry.getValue();
@@ -521,8 +549,23 @@ public class MeshCoreActivity extends Activity {
                 tvU.setPadding(dp(6), dp(5), dp(6), dp(5));
                 tvU.setBackground(roundBg(Color.parseColor("#111B2E"), Color.parseColor("#1E293B"), dp(1), dp(6)));
                 tvU.setOnClickListener(new View.OnClickListener() {
+                    private long lastTapMs = 0;
                     @Override
                     public void onClick(View v) {
+                        long now = System.currentTimeMillis();
+                        if (now - lastTapMs <= 650) {
+                            lastTapMs = 0;
+                            String dmTab = "@" + uName;
+                            if (!joinedChannels.contains(dmTab)) {
+                                joinedChannels.add(dmTab);
+                                channelMessages.put(dmTab, new ArrayList<ChatMsgItem>());
+                                appendSystemMessage(dmTab, "Direct Message session with " + uName);
+                            }
+                            activeChannel = dmTab;
+                            switchMobileTab(0);
+                            return;
+                        }
+                        lastTapMs = now;
                         if (etChatInput != null) {
                             String cur = etChatInput.getText().toString();
                             String tag = "@[" + uName + "] ";
@@ -537,7 +580,29 @@ public class MeshCoreActivity extends Activity {
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
                 ulp.setMargins(0, 0, 0, dp(4));
                 nickCol.addView(tvU, ulp);
+                userViews.add(tvU);
+                userNames.add(uName.toLowerCase(Locale.US));
             }
+
+            etNickSearch.addTextChangedListener(new TextWatcher() {
+                @Override
+                public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+                @Override
+                public void onTextChanged(CharSequence s, int start, int before, int count) {
+                    String q = s == null ? "" : s.toString().trim().toLowerCase(Locale.US);
+                    int shown = 1;
+                    for (int i = 0; i < userViews.size(); i++) {
+                        boolean match = q.isEmpty() || userNames.get(i).contains(q);
+                        userViews.get(i).setVisibility(match ? View.VISIBLE : View.GONE);
+                        if (match) shown++;
+                    }
+                    tvHdr.setText(q.isEmpty()
+                            ? ("ROOM USERS (" + roomUserCount + ")")
+                            : ("ROOM USERS (" + shown + "/" + roomUserCount + ")"));
+                }
+                @Override
+                public void afterTextChanged(Editable s) {}
+            });
 
             nickScroll.addView(nickCol);
             middleRow.addView(nickScroll, new LinearLayout.LayoutParams(

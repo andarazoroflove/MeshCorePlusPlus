@@ -797,6 +797,7 @@ struct DiscoveredChannel {
 enum class ActiveInputTarget {
     ChatComposer,
     SnifferFilter,
+    NicklistFilter,
     CallsignEditor
 };
 
@@ -918,6 +919,7 @@ struct RelayStat {
 class MeshGuiApp {
 public:
     static constexpr const char* CONSOLE_TAB = "*Console*";
+    static constexpr const char* ALL_HEARD_TAB = "All Heard Members";
 
     std::string callsign = "N0CALL";
     std::string connected_port;
@@ -1037,6 +1039,7 @@ public:
     D2D1_RECT_F chat_view_rect{};
     D2D1_RECT_F nick_view_rect{};
     int nicklist_scroll = 0;
+    std::string nicklist_filter;
     D2D1_RECT_F sniffer_view_rect{};
     D2D1_RECT_F nodes_view_rect{};
     POINT mouse_pt{0, 0};
@@ -1408,7 +1411,9 @@ public:
                     ensure_column_weights(loaded_cols[cidx]);
                 } else if (tag == "TAB" && cols.size() >= 2) {
                     std::string ch = trim_str(cols[1]);
-                    if (!ch.empty() && ch != CONSOLE_TAB && normalize_channel_name(ch) != PUBLIC_CHANNEL_NAME) {
+                    if (!ch.empty() && ch != CONSOLE_TAB && ch != ALL_HEARD_TAB &&
+                        _stricmp(ch.c_str(), ALL_HEARD_TAB) != 0 &&
+                        normalize_channel_name(ch) != PUBLIC_CHANNEL_NAME) {
                         bool exists = false;
                         for (const auto& t : tabs) {
                             if (_stricmp(t.name.c_str(), ch.c_str()) == 0 ||
@@ -1522,6 +1527,13 @@ public:
 
         sort_and_recount_mesh_nodes();
         sort_discovered();
+        if (tabs.size() > 1 && !mesh_nodes.empty()) {
+            for (const auto& nd : mesh_nodes) {
+                if (!nd.name.empty()) {
+                    tabs[1].ensure_mentioned_station(nd.name);
+                }
+            }
+        }
         for (size_t i = 0; i < tabs.size(); ++i) {
             if (_stricmp(tabs[i].name.c_str(), target_active.c_str()) == 0 ||
                 normalize_channel_name(tabs[i].name) == normalize_channel_name(target_active)) {
@@ -1656,6 +1668,20 @@ public:
         tabs[active_tab_idx].messages.push_back(ChatMessage{
             now_hms_str(), "*", false, 0, 0.0f, 0, text, true, false, false
         });
+    }
+
+    void log_all_heard(const std::string& sender,
+                       const std::string& text,
+                       int16_t rssi = 0,
+                       float snr = 0.0f,
+                       uint8_t hops = 0,
+                       bool is_sys = false,
+                       bool has_rf = false) {
+        (void)text;
+        (void)has_rf;
+        if (!is_sys && !sender.empty() && sender != "SYSTEM" && sender != "*" && tabs.size() > 1) {
+            tabs[1].update_station(sender, rssi, snr, hops);
+        }
     }
 
     std::string resolve_hop_path(uint8_t hops, uint8_t hash_size, const std::vector<uint8_t>& hop_bytes) const {
@@ -1886,6 +1912,13 @@ public:
                     << room_server_count << " Room Servers, " << chat_node_count
                     << " Companion Nodes). Live 910.525 MHz RX Active!";
                 log_public_system(oss.str());
+                if (tabs.size() > 1) {
+                    for (const auto& nd : mesh_nodes) {
+                        if (!nd.name.empty()) {
+                            tabs[1].ensure_mentioned_station(nd.name);
+                        }
+                    }
+                }
                 break;
             }
             case RadioPacketKind::ChannelMsgRecv: {
@@ -2313,7 +2346,13 @@ public:
                         DecodedRadioPacket tmp;
                         tmp.node_name = nm;
                         std::memcpy(tmp.pub_key.data(), pkt.raw.data() + 1, 32);
-                        if (nd) { tmp.contact_type = nd->contact_type; tmp.lat_e6 = nd->lat_e6; tmp.lon_e6 = nd->lon_e6; }
+                        if (nd) {
+                            tmp.contact_type = nd->contact_type;
+                            tmp.lat_e6 = nd->lat_e6;
+                            tmp.lon_e6 = nd->lon_e6;
+                        }
+                        update_or_insert_mesh_node(tmp, true);
+                        sort_and_recount_mesh_nodes();
                         record_advert(tmp, "PUSH_ADVERT", {});
                     }
                     break;
@@ -2339,6 +2378,17 @@ public:
         a.source = source;
         for (size_t i = 0; i < hops.size(); ++i) a.path += (i ? " > " : "") + hops[i].label;
         if (a.has_rf && hops.empty()) a.path = "direct";
+        {
+            std::ostringstream a_oss;
+            a_oss << "[ADVERT] " << contact_type_name(a.contact_type) << " beacon on-air [" << a.key_prefix << "]";
+            if (a.has_rf) {
+                a_oss << " @ " << a.rssi << "dBm / " << std::showpos << std::fixed << std::setprecision(1)
+                      << a.snr << "dB" << std::noshowpos << " (" << static_cast<int>(a.hops) << "h)";
+            }
+            if (!a.path.empty()) a_oss << " via " << a.path;
+            else if (!a.source.empty()) a_oss << " (" << a.source << ")";
+            log_all_heard(a.name, a_oss.str(), a.rssi, a.snr, a.hops, false, a.has_rf);
+        }
         adverts.push_back(std::move(a));
         while (adverts.size() > MAX_ADVERTS) adverts.pop_front();
         if (adverts_scroll > 0) ++adverts_scroll;
@@ -2930,6 +2980,7 @@ public:
 
         log_console("[CHAT " + ch + "] <" + sender + "> " + text +
                     (path_desc.empty() ? "" : (" [" + path_desc + "]")));
+        log_all_heard(sender, "[" + ch + "] " + full_text, rssi, snr, hops, false, true);
 
         bool delivered_to_tab = false;
         for (size_t i = 0; i < tabs.size(); ++i) {
@@ -3120,6 +3171,7 @@ public:
             tabs[1].messages.push_back(pub_notice);
         }
         log_console("[DIRECT MSG from " + sender_name + "] " + display_txt);
+        log_all_heard(sender_name, "[DIRECT MSG -> YOU] " + display_txt, rssi, snr, hops, false, true);
         state_dirty = true;
     }
 
@@ -3127,6 +3179,16 @@ public:
         std::string trimmed_raw = trim_str(raw_name);
         if (!trimmed_raw.empty() && trimmed_raw[0] == '@') {
             open_dm_tab(trimmed_raw, silent_startup);
+            return;
+        }
+        if (_stricmp(trimmed_raw.c_str(), ALL_HEARD_TAB) == 0) {
+            for (size_t i = 0; i < tabs.size(); ++i) {
+                if (tabs[i].name == ALL_HEARD_TAB) {
+                    center_view = CenterView::Chat;
+                    select_tab(i);
+                    return;
+                }
+            }
             return;
         }
         if (normalize_channel_name(trimmed_raw) == PUBLIC_CHANNEL_NAME) {
@@ -3327,8 +3389,10 @@ public:
         decode_mono_img_companion_wire(reinterpret_cast<const uint8_t*>(wire.data()), wire.size(), wire_bits);
 
         center_view = CenterView::Chat;
-        if (active_tab_idx == 0 || (active_tab_idx < tabs.size() && !tabs[active_tab_idx].name.empty() && tabs[active_tab_idx].name[0] == '@')) {
-            select_tab(1); // Switch to Public channel tab if on *Console* or @DM tab
+        if (active_tab_idx == 0 ||
+            (active_tab_idx < tabs.size() && tabs[active_tab_idx].name == ALL_HEARD_TAB) ||
+            (active_tab_idx < tabs.size() && !tabs[active_tab_idx].name.empty() && tabs[active_tab_idx].name[0] == '@')) {
+            select_tab(1); // Switch to Public channel tab if on *Console*, All Heard Members, or @DM tab
         }
 
         std::string ch = tabs[active_tab_idx].name;
@@ -3393,6 +3457,25 @@ public:
                 return;
             }
             select_tab(1);
+        } else if (active_tab_idx < tabs.size() && tabs[active_tab_idx].name == ALL_HEARD_TAB) {
+            // In "All Heard Members": if a user is targeted via @[user] or selected_station, open a Direct Message to them!
+            std::string dm_target;
+            if (line.rfind("@[", 0) == 0) {
+                auto cb = line.find("]");
+                if (cb != std::string::npos && cb > 2) {
+                    dm_target = trim_str(line.substr(2, cb - 2));
+                    std::string rest_msg = trim_str(line.substr(cb + 1));
+                    if (!rest_msg.empty()) line = rest_msg;
+                }
+            }
+            if (dm_target.empty() && !selected_station.empty()) {
+                dm_target = selected_station;
+            }
+            if (!dm_target.empty()) {
+                open_dm_tab(dm_target, false);
+            } else {
+                select_tab(1);
+            }
         }
 
         std::string ch = tabs[active_tab_idx].name;
@@ -3759,7 +3842,9 @@ enum ButtonId {
     BTN_MOB_TAB_SNIFFER = 74,
     BTN_MOB_TAB_CHANNELS = 75,
     BTN_MOB_TAB_RADIO = 76,
-    BTN_TOGGLE_NICKLIST = 77
+    BTN_TOGGLE_NICKLIST = 77,
+    BTN_NICKLIST_FILTER_BOX = 78,
+    BTN_NICKLIST_FILTER_CLEAR = 79
 };
 
 class D2DRenderer {
@@ -4892,7 +4977,7 @@ private:
             if (tab.unread_count > 0 && !active) {
                 label += " (+" + std::to_string(tab.unread_count) + ")";
             }
-            float tw = std::clamp(static_cast<float>(label.size()) * 8.2f + (i > 1 ? 38.0f : 24.0f), 82.0f, 175.0f);
+            float tw = std::clamp(static_cast<float>(label.size()) * 8.2f + (i > 1 ? 38.0f : 24.0f), 82.0f, 185.0f);
             if (tx + tw > x + w - 10.0f) break;
 
             D2D1_RECT_F tr = D2D1::RectF(tx, y + 6, tx + tw, y + 36);
@@ -4928,11 +5013,14 @@ private:
 
         // Build unified participant list for this room:
         // 1. Speakers & @[mentioned] stations in this tab
-        // 2. For Public channel (Slot 0 default on every Companion node), also include all heard Companion/Room stations!
+        // 2. For Public, include EVERY heard user across all tabs, live adverts, and mesh_nodes!
         std::vector<HeardStation> room_users;
-        room_users.reserve(active_tab.nicks.size() + (is_public_tab ? app.mesh_nodes.size() : 0));
+        room_users.reserve(active_tab.nicks.size() + (is_public_tab ? app.mesh_nodes.size() + 32 : 0));
         auto has_user = [&](const std::string& name) {
-            if (name.empty() || _stricmp(name.c_str(), app.callsign.c_str()) == 0) return true;
+            if (name.empty() || name == "SYSTEM" || name == "*" || name == "(unnamed)" ||
+                _stricmp(name.c_str(), app.callsign.c_str()) == 0) {
+                return true;
+            }
             for (const auto& u : room_users) {
                 if (_stricmp(u.callsign.c_str(), name.c_str()) == 0) return true;
             }
@@ -4942,8 +5030,29 @@ private:
             if (!has_user(st.callsign)) room_users.push_back(st);
         }
         if (is_public_tab) {
+            // Include speakers from every channel / DM tab
+            for (const auto& t : app.tabs) {
+                for (const auto& st : t.nicks) {
+                    if (!has_user(st.callsign)) room_users.push_back(st);
+                }
+            }
+            // Include every live advert station (newest first)
+            for (auto it = app.adverts.rbegin(); it != app.adverts.rend(); ++it) {
+                if (!has_user(it->name)) {
+                    HeardStation hs;
+                    hs.callsign = it->name;
+                    hs.last_rssi = it->rssi;
+                    hs.last_snr = it->snr;
+                    hs.hops = it->hops;
+                    hs.last_heard_time = it->time.size() >= 8 ? it->time.substr(0, 8) : it->time;
+                    hs.last_heard_epoch = now_epoch_secs();
+                    hs.msg_count = 0;
+                    room_users.push_back(std::move(hs));
+                }
+            }
+            // Include EVERY single node in mesh_nodes (Companions, Repeaters, Room Servers, Sensors)
             for (const auto& nd : app.mesh_nodes) {
-                if ((nd.contact_type == 1 || nd.contact_type == 3) && !has_user(nd.name)) {
+                if (!has_user(nd.name)) {
                     HeardStation hs;
                     hs.callsign = nd.name;
                     hs.last_rssi = nd.live_rssi;
@@ -5041,19 +5150,56 @@ private:
             fill_round_rect(nick_box, 8.0f, hex_color(0x0B111E));
             draw_round_rect(nick_box, 8.0f, hex_color(0x1E293B), 1.0f);
 
+            std::string nf_lower = app.nicklist_filter;
+            std::transform(nf_lower.begin(), nf_lower.end(), nf_lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+            std::vector<const HeardStation*> filtered_users;
+            filtered_users.reserve(room_users.size());
+            for (const auto& st : room_users) {
+                if (!nf_lower.empty()) {
+                    std::string cs_low = st.callsign;
+                    std::transform(cs_low.begin(), cs_low.end(), cs_low.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (cs_low.find(nf_lower) == std::string::npos) continue;
+                }
+                filtered_users.push_back(&st);
+            }
+
             // Header bar
-            D2D1_RECT_F nhdr = D2D1::RectF(nick_box.left + 4, nick_box.top + 4, nick_box.right - 4, nick_box.top + 26);
+            D2D1_RECT_F nhdr = D2D1::RectF(nick_box.left + 4, nick_box.top + 4, nick_box.right - 4, nick_box.top + 25);
             fill_round_rect(nhdr, 5.0f, hex_color(0x131C2E));
-            draw_text("ROOM USERS (" + std::to_string(room_user_count) + ")", font_small,
+            std::string hdr_lbl = nf_lower.empty()
+                                      ? ("ROOM USERS (" + std::to_string(room_user_count) + ")")
+                                      : ("ROOM USERS (" + std::to_string(filtered_users.size()) + "/" + std::to_string(room_user_count) + ")");
+            draw_text(hdr_lbl, font_small,
                       D2D1::RectF(nhdr.left + 8, nhdr.top, nhdr.right - 6, nhdr.bottom), hex_color(0x00E5FF));
 
-            float ny = nhdr.bottom + 4.0f;
+            // Search / Filter Input Box inside ROOM USERS
+            D2D1_RECT_F nf_r = D2D1::RectF(nick_box.left + 4, nhdr.bottom + 3, nick_box.right - 4, nhdr.bottom + 26);
+            bool nf_focused = (app.active_input == ActiveInputTarget::NicklistFilter);
+            fill_round_rect(nf_r, 4.0f, hex_color(0x090D16));
+            draw_round_rect(nf_r, 4.0f, nf_focused ? hex_color(0x00E5FF) : hex_color(0x26354D), 1.1f);
+            std::string nf_disp = app.nicklist_filter.empty()
+                                      ? (nf_focused ? "Search: _" : "Search users...")
+                                      : (app.nicklist_filter + (nf_focused ? "_" : ""));
+            draw_text(nf_disp, font_mono_small,
+                      D2D1::RectF(nf_r.left + 6, nf_r.top, nf_r.right - (app.nicklist_filter.empty() ? 6 : 20), nf_r.bottom),
+                      app.nicklist_filter.empty() && !nf_focused ? hex_color(0x64748B) : hex_color(0xE2E8F0));
+            app.button_hits.push_back({nf_r, BTN_NICKLIST_FILTER_BOX, ""});
+            if (!app.nicklist_filter.empty()) {
+                D2D1_RECT_F nfc_r = D2D1::RectF(nf_r.right - 20, nf_r.top + 1, nf_r.right - 2, nf_r.bottom - 1);
+                draw_text("x", font_small, nfc_r, hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
+                app.button_hits.push_back({nfc_r, BTN_NICKLIST_FILTER_CLEAR, ""});
+            }
+
+            float ny = nf_r.bottom + 4.0f;
             const float nrow_h = 26.0f;
             const float nmax_y = nick_box.bottom - 20.0f;
             const uint64_t now_s = now_epoch_secs();
 
-            // Row 0: Self ([YOU])
-            if (ny + nrow_h <= nmax_y) {
+            // Row 0: Self ([YOU]) when unfiltered
+            if (nf_lower.empty() && ny + nrow_h <= nmax_y) {
                 D2D1_RECT_F sr = D2D1::RectF(nick_box.left + 5, ny, nick_box.right - 5, ny + nrow_h - 2);
                 fill_round_rect(sr, 4.0f, hex_color(0x10B981, 0.14f));
                 draw_round_rect(sr, 4.0f, hex_color(0x10B981, 0.45f), 1.0f);
@@ -5067,12 +5213,12 @@ private:
                 ny += nrow_h;
             }
 
-            int max_nick_scroll = std::max(0, static_cast<int>(room_users.size()) - 4);
+            int max_nick_scroll = std::max(0, static_cast<int>(filtered_users.size()) - 4);
             app.nicklist_scroll = std::clamp(app.nicklist_scroll, 0, max_nick_scroll);
 
             // Room participants sorted by recency
-            for (size_t idx = static_cast<size_t>(app.nicklist_scroll); idx < room_users.size(); ++idx) {
-                const auto& st = room_users[idx];
+            for (size_t idx = static_cast<size_t>(app.nicklist_scroll); idx < filtered_users.size(); ++idx) {
+                const auto& st = *filtered_users[idx];
                 if (ny + nrow_h > nmax_y) break;
 
                 D2D1_RECT_F ur = D2D1::RectF(nick_box.left + 5, ny, nick_box.right - 5, ny + nrow_h - 2);
@@ -6536,6 +6682,19 @@ static void handle_left_click(HWND hwnd, POINT pt) {
     // 6b. Check Room Participant / Nicklist rows (single-click/tap replies @[user], double-click opens @DM tab!)
     for (const auto& hit : g_app->nicklist_hits) {
         if (D2DRenderer::pt_in_rect(pt, hit.rect)) {
+            static std::string last_nick_user;
+            static uint64_t last_nick_ms = 0;
+            uint64_t now_ms = GetTickCount64();
+            if (_stricmp(last_nick_user.c_str(), hit.payload.c_str()) == 0 && (now_ms - last_nick_ms) <= 650) {
+                last_nick_user.clear();
+                last_nick_ms = 0;
+                g_app->clear_reply_target();
+                g_app->open_dm_tab(hit.payload, false);
+                g_app->active_input = ActiveInputTarget::ChatComposer;
+                return;
+            }
+            last_nick_user = hit.payload;
+            last_nick_ms = now_ms;
             g_app->selected_station = hit.payload;
             g_app->reply_to_user(hit.payload);
             g_app->active_input = ActiveInputTarget::ChatComposer;
@@ -6543,9 +6702,22 @@ static void handle_left_click(HWND hwnd, POINT pt) {
         }
     }
 
-    // 7. Check Heard Station / Mesh System Cards (single-click selects; double-click replies directly!)
+    // 7. Check Heard Station / Mesh System Cards (single-click selects; double-click opens @DM tab!)
     for (const auto& hit : g_app->station_hits) {
         if (D2DRenderer::pt_in_rect(pt, hit.rect)) {
+            static std::string last_st_user;
+            static uint64_t last_st_ms = 0;
+            uint64_t now_ms = GetTickCount64();
+            if (_stricmp(last_st_user.c_str(), hit.payload.c_str()) == 0 && (now_ms - last_st_ms) <= 650) {
+                last_st_user.clear();
+                last_st_ms = 0;
+                g_app->clear_reply_target();
+                g_app->open_dm_tab(hit.payload, false);
+                g_app->active_input = ActiveInputTarget::ChatComposer;
+                return;
+            }
+            last_st_user = hit.payload;
+            last_st_ms = now_ms;
             g_app->selected_station = hit.payload;
             g_app->active_input = ActiveInputTarget::ChatComposer;
             return;
@@ -6775,6 +6947,14 @@ static void handle_left_click(HWND hwnd, POINT pt) {
                     g_app->show_room_nicklist_override = cur_open ? -1 : 1;
                     break;
                 }
+                case BTN_NICKLIST_FILTER_BOX:
+                    g_app->active_input = ActiveInputTarget::NicklistFilter;
+                    break;
+                case BTN_NICKLIST_FILTER_CLEAR:
+                    g_app->nicklist_filter.clear();
+                    g_app->nicklist_scroll = 0;
+                    g_app->active_input = ActiveInputTarget::NicklistFilter;
+                    break;
             }
             return;
         }
@@ -6815,7 +6995,9 @@ static void handle_left_double_click(HWND, POINT pt) {
     // 1. Double-clicking any user/node card in the Right Sidebar (Public Mesh System / Heard Stations)
     for (const auto& hit : g_app->station_hits) {
         if (D2DRenderer::pt_in_rect(pt, hit.rect)) {
-            g_app->reply_to_user(hit.payload);
+            g_app->clear_reply_target();
+            g_app->open_dm_tab(hit.payload, false);
+            g_app->active_input = ActiveInputTarget::ChatComposer;
             return;
         }
     }
@@ -6823,7 +7005,14 @@ static void handle_left_double_click(HWND, POINT pt) {
     // 2. Double-clicking any user message / <Sender> badge / live beacon in the Center Chat View
     for (const auto& hit : g_app->chat_user_hits) {
         if (D2DRenderer::pt_in_rect(pt, hit.rect)) {
-            g_app->reply_to_user(hit.payload);
+            if (g_app->active_tab_idx < g_app->tabs.size() &&
+                g_app->tabs[g_app->active_tab_idx].name == MeshGuiApp::ALL_HEARD_TAB) {
+                g_app->clear_reply_target();
+                g_app->open_dm_tab(hit.payload, false);
+                g_app->active_input = ActiveInputTarget::ChatComposer;
+            } else {
+                g_app->reply_to_user(hit.payload);
+            }
             return;
         }
     }
@@ -7111,6 +7300,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         g_app->cancel_pending_image();
                     } else if (g_app->active_input == ActiveInputTarget::SnifferFilter) {
                         g_app->sniffer_filter.clear();
+                    } else if (g_app->active_input == ActiveInputTarget::NicklistFilter) {
+                        g_app->nicklist_filter.clear();
+                        g_app->nicklist_scroll = 0;
                     } else if (!g_app->replying_to_user.empty()) {
                         g_app->clear_reply_target();
                     }
@@ -7135,6 +7327,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         if (g_app->chat_input.empty()) g_app->replying_to_user.clear();
                     } else if (g_app->active_input == ActiveInputTarget::SnifferFilter) {
                         if (!g_app->sniffer_filter.empty()) g_app->sniffer_filter.pop_back();
+                    } else if (g_app->active_input == ActiveInputTarget::NicklistFilter) {
+                        if (!g_app->nicklist_filter.empty()) g_app->nicklist_filter.pop_back();
+                        g_app->nicklist_scroll = 0;
                     } else if (g_app->active_input == ActiveInputTarget::CallsignEditor) {
                         if (!g_app->callsign.empty()) g_app->callsign.pop_back();
                     }
@@ -7145,6 +7340,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     } else if (g_app->active_input == ActiveInputTarget::SnifferFilter) {
                         g_app->sniffer_filter.push_back(c);
                         g_app->sniffer_scroll = 0;
+                    } else if (g_app->active_input == ActiveInputTarget::NicklistFilter) {
+                        g_app->nicklist_filter.push_back(c);
+                        g_app->nicklist_scroll = 0;
                     } else if (g_app->active_input == ActiveInputTarget::CallsignEditor) {
                         if (g_app->callsign.size() < 14 && c != ' ' && c != ':') {
                             g_app->callsign.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
@@ -7349,6 +7547,7 @@ static void ios_sync_tf_from_app() {
     if (!g_ios_tf || !g_app) return;
     const std::string* src = &g_app->chat_input;
     if (g_app->active_input == ActiveInputTarget::SnifferFilter) src = &g_app->sniffer_filter;
+    else if (g_app->active_input == ActiveInputTarget::NicklistFilter) src = &g_app->nicklist_filter;
     else if (g_app->active_input == ActiveInputTarget::CallsignEditor) src = &g_app->callsign;
     msg_send<void>(g_ios_tf, sel_registerName("setText:"), ns_str(src->c_str()));
 }
@@ -7459,7 +7658,8 @@ static void ios_touches_ended(id self, SEL, id touches, id) {
             for (const auto& b : g_app->button_hits) {
                 if (D2DRenderer::pt_in_rect(win_pt, b.rect)) {
                     if (b.id == BTN_CHAT_INPUT_BOX || b.id == BTN_ADD_TAG ||
-                        b.id == BTN_SNIFFER_FILTER_BOX || b.id == BTN_CALLSIGN) {
+                        b.id == BTN_SNIFFER_FILTER_BOX || b.id == BTN_NICKLIST_FILTER_BOX ||
+                        b.id == BTN_CALLSIGN) {
                         hit_text_box = true;
                     } else if (b.id == BTN_TRANSMIT_TX) {
                         hit_tx_btn = true;
@@ -7506,6 +7706,9 @@ static void ios_on_text_changed(id self, SEL, id sender) {
     } else if (g_app->active_input == ActiveInputTarget::SnifferFilter) {
         g_app->sniffer_filter = val;
         g_app->sniffer_scroll = 0;
+    } else if (g_app->active_input == ActiveInputTarget::NicklistFilter) {
+        g_app->nicklist_filter = val;
+        g_app->nicklist_scroll = 0;
     } else if (g_app->active_input == ActiveInputTarget::CallsignEditor) {
         std::string clean;
         for (unsigned char c : val) {
