@@ -90,6 +90,7 @@ public class MeshCoreActivity extends Activity {
     private String callsign = "MobileOp";
     private String activeChannel = "Public";
     private int activeMobileTab = 0; // 0=Chat, 1=Nodes, 2=Sniffer, 3=Channels, 4=Radio
+    private boolean showRoomParticipants = false;
 
     // Radio state
     private BluetoothAdapter btAdapter;
@@ -411,21 +412,131 @@ public class MeshCoreActivity extends Activity {
                 promptJoinHashtagChannel();
             }
         });
-        channelPillsContainer.addView(btnAddCh, new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams addChLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(32));
+        addChLp.setMargins(0, 0, dp(6), 0);
+        channelPillsContainer.addView(btnAddCh, addChLp);
+
+        // Count unique participants in activeChannel (always includes self)
+        final Map<String, Integer> roomNicks = new LinkedHashMap<>();
+        List<ChatMsgItem> curMsgs = channelMessages.get(activeChannel);
+        if (curMsgs != null) {
+            for (int i = curMsgs.size() - 1; i >= 0; --i) {
+                ChatMsgItem m = curMsgs.get(i);
+                if (!m.isSystem && m.sender != null && !m.sender.isEmpty() && !m.sender.equalsIgnoreCase(callsign)) {
+                    Integer prev = roomNicks.get(m.sender);
+                    roomNicks.put(m.sender, prev == null ? 1 : prev + 1);
+                }
+            }
+        }
+        final int roomUserCount = 1 + roomNicks.size();
+
+        Button btnUsers = new Button(this);
+        btnUsers.setText("Users: " + roomUserCount);
+        btnUsers.setAllCaps(false);
+        btnUsers.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        btnUsers.setTextColor(showRoomParticipants ? Color.parseColor("#10B981") : Color.parseColor("#38BDF8"));
+        btnUsers.setPadding(dp(10), dp(2), dp(10), dp(2));
+        btnUsers.setBackground(roundBg(
+                showRoomParticipants ? Color.parseColor("#0D2822") : Color.parseColor("#111B2E"),
+                showRoomParticipants ? Color.parseColor("#10B981") : Color.parseColor("#38BDF8"),
+                dp(1), dp(14)));
+        btnUsers.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showRoomParticipants = !showRoomParticipants;
+                switchMobileTab(activeMobileTab);
+            }
+        });
+        channelPillsContainer.addView(btnUsers, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)));
 
         hsv.addView(channelPillsContainer);
         mainContentFrame.addView(hsv, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // Scrollable Message Feed
+        // Middle Content Area: Scrollable Message Feed + Optional mIRC-Style Room Participant Sidebar
+        LinearLayout middleRow = new LinearLayout(this);
+        middleRow.setOrientation(LinearLayout.HORIZONTAL);
+
         chatScrollView = new ScrollView(this);
         chatScrollView.setFillViewport(true);
         chatFeedLayout = new LinearLayout(this);
         chatFeedLayout.setOrientation(LinearLayout.VERTICAL);
         chatFeedLayout.setPadding(dp(10), dp(8), dp(10), dp(8));
         chatScrollView.addView(chatFeedLayout);
-        mainContentFrame.addView(chatScrollView, new LinearLayout.LayoutParams(
+        middleRow.addView(chatScrollView, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+
+        if (showRoomParticipants) {
+            ScrollView nickScroll = new ScrollView(this);
+            nickScroll.setBackgroundColor(Color.parseColor("#0B111E"));
+            LinearLayout nickCol = new LinearLayout(this);
+            nickCol.setOrientation(LinearLayout.VERTICAL);
+            nickCol.setPadding(dp(6), dp(6), dp(6), dp(6));
+
+            TextView tvHdr = new TextView(this);
+            tvHdr.setText("ROOM USERS (" + roomUserCount + ")");
+            tvHdr.setTextColor(Color.parseColor("#00E5FF"));
+            tvHdr.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            tvHdr.setTypeface(Typeface.DEFAULT_BOLD);
+            tvHdr.setPadding(dp(4), dp(2), dp(4), dp(6));
+            nickCol.addView(tvHdr);
+
+            // Row 0: Self ([YOU])
+            TextView tvSelf = new TextView(this);
+            tvSelf.setText("● +" + callsign + " [YOU]");
+            tvSelf.setTextColor(Color.parseColor("#10B981"));
+            tvSelf.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            tvSelf.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+            tvSelf.setPadding(dp(6), dp(5), dp(6), dp(5));
+            tvSelf.setBackground(roundBg(Color.parseColor("#0D2822"), Color.parseColor("#10B981"), dp(1), dp(6)));
+            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            slp.setMargins(0, 0, 0, dp(4));
+            nickCol.addView(tvSelf, slp);
+
+            for (Map.Entry<String, Integer> entry : roomNicks.entrySet()) {
+                final String uName = entry.getKey();
+                final int mCnt = entry.getValue();
+                NodeItem nd = meshNodes.get(uName);
+                String prefix = (nd != null && nd.type == 3) ? "@" : (nd != null && nd.type == 2) ? "^" : "+";
+                int uCol = (nd != null && nd.type == 3) ? Color.parseColor("#C084FC")
+                         : (nd != null && nd.type == 2) ? Color.parseColor("#38BDF8")
+                                                        : Color.parseColor("#E2E8F0");
+
+                TextView tvU = new TextView(this);
+                tvU.setText("● " + prefix + uName + " (" + mCnt + "m)");
+                tvU.setTextColor(uCol);
+                tvU.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+                tvU.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+                tvU.setPadding(dp(6), dp(5), dp(6), dp(5));
+                tvU.setBackground(roundBg(Color.parseColor("#111B2E"), Color.parseColor("#1E293B"), dp(1), dp(6)));
+                tvU.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        if (etChatInput != null) {
+                            String cur = etChatInput.getText().toString();
+                            String tag = "@[" + uName + "] ";
+                            if (!cur.startsWith(tag)) {
+                                etChatInput.setText(tag + cur);
+                                etChatInput.setSelection(etChatInput.getText().length());
+                            }
+                        }
+                    }
+                });
+                LinearLayout.LayoutParams ulp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                ulp.setMargins(0, 0, 0, dp(4));
+                nickCol.addView(tvU, ulp);
+            }
+
+            nickScroll.addView(nickCol);
+            middleRow.addView(nickScroll, new LinearLayout.LayoutParams(
+                    dp(145), ViewGroup.LayoutParams.MATCH_PARENT));
+        }
+
+        mainContentFrame.addView(middleRow, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         renderChatMessages();

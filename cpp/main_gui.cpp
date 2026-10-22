@@ -732,27 +732,53 @@ struct ChannelTab {
 
     explicit ChannelTab(std::string n = "") : name(std::move(n)) {}
 
-    void update_station(const std::string& call, int16_t rssi, float snr, uint8_t hops) {
-        std::string t_str = now_hms_str();
-        uint64_t ep = now_epoch_secs();
+    void update_station(const std::string& call, int16_t rssi, float snr, uint8_t hops, const std::string& custom_time = "") {
+        if (call.empty() || call == "*" || call == "SYSTEM" || call == "RADIO") return;
+        std::string t_str = custom_time.empty() ? now_hms_str() : custom_time;
+        uint64_t ep = custom_time.empty() ? now_epoch_secs() : 1;
         for (auto& st : nicks) {
             if (_stricmp(st.callsign.c_str(), call.c_str()) == 0) {
-                st.last_rssi = rssi;
-                st.last_snr = snr;
-                st.hops = hops;
+                if (rssi != 0 || snr != 0.0f) {
+                    st.last_rssi = rssi;
+                    st.last_snr = snr;
+                    st.hops = hops;
+                }
                 st.last_heard_time = t_str;
-                st.last_heard_epoch = ep;
+                if (ep > st.last_heard_epoch) st.last_heard_epoch = ep;
                 st.msg_count++;
                 std::sort(nicks.begin(), nicks.end(), [](const auto& a, const auto& b) {
-                    return a.last_heard_epoch > b.last_heard_epoch;
+                    if (a.last_heard_epoch != b.last_heard_epoch) return a.last_heard_epoch > b.last_heard_epoch;
+                    return a.msg_count > b.msg_count;
                 });
                 return;
             }
         }
         nicks.push_back(HeardStation{call, rssi, snr, hops, t_str, ep, 1});
         std::sort(nicks.begin(), nicks.end(), [](const auto& a, const auto& b) {
-            return a.last_heard_epoch > b.last_heard_epoch;
+            if (a.last_heard_epoch != b.last_heard_epoch) return a.last_heard_epoch > b.last_heard_epoch;
+            return a.msg_count > b.msg_count;
         });
+    }
+
+    void ensure_mentioned_station(const std::string& call, const std::string& t_str = "") {
+        if (call.empty() || call == "*" || call == "SYSTEM" || call == "RADIO") return;
+        for (const auto& st : nicks) {
+            if (_stricmp(st.callsign.c_str(), call.c_str()) == 0) return;
+        }
+        nicks.push_back(HeardStation{call, -80, 0.0f, 0, t_str.empty() ? now_hms_str() : t_str, 0, 0});
+    }
+
+    void scan_text_mentions(const std::string& txt, const std::string& t_str = "") {
+        size_t pos = 0;
+        while ((pos = txt.find("@[", pos)) != std::string::npos) {
+            auto end = txt.find(']', pos + 2);
+            if (end == std::string::npos) break;
+            std::string m = txt.substr(pos + 2, end - (pos + 2));
+            if (!m.empty() && m.size() <= 28) {
+                ensure_mentioned_station(m, t_str);
+            }
+            pos = end + 1;
+        }
     }
 };
 
@@ -972,6 +998,7 @@ public:
     // Cols 2..3 are on the Right of the main chat window (up to 2 wide, up to 4 stacked each)
     bool light_mode = false;
     int mobile_tab = 0; // 0=Chat, 1=Nodes, 2=#Sniffer, 3=#Channels, 4=Radio
+    int show_room_nicklist_override = 0; // 0=auto (open on desktop, toggleable on mobile), 1=open, -1=closed
     std::array<ModuleColumn, 4> module_cols;
 
     int dragging_module = -1;       // -1 if not dragging a module, else 0..3
@@ -1001,6 +1028,7 @@ public:
     std::vector<HitRect> button_hits;
     std::vector<HitRect> chat_hashtag_hits;
     std::vector<HitRect> chat_user_hits;
+    std::vector<HitRect> nicklist_hits;
     std::vector<HitRect> station_hits;
     std::vector<HitRect> slot_hits;
     std::vector<HitRect> serial_menu_hits;
@@ -1452,6 +1480,10 @@ public:
                                 if (hex_to_bytes(cols[11], m.mono_image.data(), MONO_IMG_BYTES)) {
                                     m.has_mono_image = true;
                                 }
+                            }
+                            if (!m.is_system && !m.sender.empty()) {
+                                tab.update_station(m.sender, m.rssi, m.snr, m.hops, m.timestamp);
+                                tab.scan_text_mentions(m.text, m.timestamp);
                             }
                             tab.messages.push_back(std::move(m));
                             ++loaded_msgs;
@@ -2902,6 +2934,7 @@ public:
             if (_stricmp(tabs[i].name.c_str(), ch.c_str()) == 0 ||
                 normalize_channel_name(tabs[i].name) == normalize_channel_name(ch)) {
                 tabs[i].update_station(sender, rssi, snr, hops);
+                tabs[i].scan_text_mentions(text);
                 tabs[i].messages.push_back(msg);
                 if (i != active_tab_idx) {
                     tabs[i].unread_count++;
@@ -2918,6 +2951,7 @@ public:
         auto& bg = background_buffers[normalize_channel_name(ch)];
         if (bg.name.empty()) bg.name = ch;
         bg.update_station(sender, rssi, snr, hops);
+        bg.scan_text_mentions(text);
         bg.messages.push_back(msg);
         bg.unread_count++;
         if (is_mention) bg.has_mention = true;
@@ -3021,6 +3055,7 @@ public:
         }
         new_tab.unread_count = 0;
         new_tab.has_mention = false;
+        new_tab.ensure_mentioned_station(canonical.substr(1));
 
         std::ostringstream oss;
         if (nd) {
@@ -3317,6 +3352,7 @@ public:
         msg.has_mono_image = true;
         msg.mono_image = wire_bits;
         msg.trace_key = dedup_key;
+        tabs[active_tab_idx].update_station(callsign, 0, 0.0f, 0);
         tabs[active_tab_idx].messages.push_back(std::move(msg));
         tabs[active_tab_idx].scroll_offset = 0;
         log_console("[TX 0x49 MONO_IMG] Transmitted '" + (img_name.empty() ? std::string("bitmap") : img_name) +
@@ -3385,6 +3421,8 @@ public:
         }
         transport.send_channel_message(slot_idx, ch, callsign, line);
 
+        tabs[active_tab_idx].update_station(callsign, 0, 0.0f, 0);
+        tabs[active_tab_idx].scan_text_mentions(line);
         tabs[active_tab_idx].messages.push_back(ChatMessage{
             now_hms_str(), callsign, false, 0, 0.0f, 0, line, false, false, true
         });
@@ -3617,8 +3655,27 @@ public:
             else if (what == "adverts") export_adverts_csv();
             else if (what == "all" || what.empty()) export_all();
             else log_active_tab("Usage: /export [nodes|kml|packets|adverts|all]");
+        } else if (cmd == "/users" || cmd == "/names" || cmd == "/who") {
+            show_room_nicklist_override = (show_room_nicklist_override == 1) ? -1 : 1;
+            if (active_tab_idx < tabs.size()) {
+                const auto& t = tabs[active_tab_idx];
+                std::ostringstream oss;
+                size_t cnt = 1;
+                for (const auto& st : t.nicks) {
+                    if (_stricmp(st.callsign.c_str(), callsign.c_str()) != 0) ++cnt;
+                }
+                oss << "[ROOM USERS in " << t.name << " (" << cnt << ")]: +" << callsign << " [YOU]";
+                for (const auto& st : t.nicks) {
+                    if (_stricmp(st.callsign.c_str(), callsign.c_str()) == 0) continue;
+                    const auto* nd = find_mesh_node(st.callsign);
+                    char prefix = (nd && nd->contact_type == 3) ? '@' : (nd && nd->contact_type == 2) ? '^' : '+';
+                    oss << ", " << prefix << st.callsign;
+                    if (st.msg_count > 0) oss << " (" << st.msg_count << "m)";
+                }
+                log_active_tab(oss.str());
+            }
         } else if (cmd == "/help") {
-            log_active_tab("Commands: /join #tag, /image [file], /dm <node> [msg], /advert [flood|direct], /tracepath <node>, /part, /serial [COMx], /ble, /sim, /nick <CALL>, /addword #tag, /slots, /list, /clear, /save");
+            log_active_tab("Commands: /join #tag, /users (/names), /image [file], /dm <node> [msg], /advert [flood|direct], /tracepath <node>, /part, /serial [COMx], /ble, /sim, /nick <CALL>, /addword #tag, /slots, /list, /clear, /save");
             log_active_tab("Repeater Admin & Capture: /rlogin [rpt] <pass>, /rcmd [rpt] <ver|neighbors|clock|stats|reboot>, /cli <cmd>, /rstatus [rpt], /rtelemetry [rpt], /resetpath [node], /record [on|off], /replay [file]");
             log_active_tab("Snooping: /packets (hex inspector), /adverts (advert log), /paths (relay path tracer), /map, /chat, /export [nodes|kml|packets|adverts|all]");
         } else {
@@ -3699,7 +3756,8 @@ enum ButtonId {
     BTN_MOB_TAB_NODES = 73,
     BTN_MOB_TAB_SNIFFER = 74,
     BTN_MOB_TAB_CHANNELS = 75,
-    BTN_MOB_TAB_RADIO = 76
+    BTN_MOB_TAB_RADIO = 76,
+    BTN_TOGGLE_NICKLIST = 77
 };
 
 class D2DRenderer {
@@ -4104,6 +4162,7 @@ public:
         app.button_hits.clear();
         app.chat_hashtag_hits.clear();
         app.chat_user_hits.clear();
+        app.nicklist_hits.clear();
         app.station_hits.clear();
         app.slot_hits.clear();
         app.serial_menu_hits.clear();
@@ -4862,7 +4921,17 @@ private:
         draw_round_rect(crypto_bar, 6.0f, hex_color(0x1E293B), 1.0f);
 
         const auto& active_tab = app.tabs[app.active_tab_idx];
-        if (active_tab.name == MeshGuiApp::CONSOLE_TAB) {
+        const bool is_console_tab = (active_tab.name == MeshGuiApp::CONSOLE_TAB);
+        size_t room_user_count = 1; // Always includes self
+        for (const auto& st : active_tab.nicks) {
+            if (_stricmp(st.callsign.c_str(), app.callsign.c_str()) != 0) ++room_user_count;
+        }
+        const bool default_nicks_open = (w >= 520.0f);
+        const bool show_nicks_pane = !is_console_tab &&
+                                     ((app.show_room_nicklist_override == 1) ||
+                                      (app.show_room_nicklist_override == 0 && default_nicks_open));
+
+        if (is_console_tab) {
             draw_text("SYSTEM CONSOLE & 256-BUCKET RAINBOW PACKET SNIFFER TELEMETRY",
                       font_mono_small, D2D1::RectF(crypto_bar.left + 12, crypto_bar.top, crypto_bar.right - 12, crypto_bar.bottom),
                       hex_color(0x38BDF8));
@@ -4876,8 +4945,15 @@ private:
                   << " | KEY PREFIX: " << khex
                   << " | ROUTE: " << ((nd && nd->out_path_len >= 0) ? ("Direct (" + std::to_string(nd->out_path_len) + "h)") : "Flood");
             draw_text(d_oss.str(), font_mono_small,
-                      D2D1::RectF(crypto_bar.left + 10, crypto_bar.top, crypto_bar.right - 102, crypto_bar.bottom),
+                      D2D1::RectF(crypto_bar.left + 10, crypto_bar.top, crypto_bar.right - 190, crypto_bar.bottom),
                       hex_color(0x34D399));
+
+            D2D1_RECT_F users_btn = D2D1::RectF(crypto_bar.right - 186, crypto_bar.top + 4, crypto_bar.right - 102, crypto_bar.bottom - 4);
+            fill_round_rect(users_btn, 5.0f, show_nicks_pane ? hex_color(0x10B981, 0.25f) : hex_color(0x162238));
+            draw_round_rect(users_btn, 5.0f, show_nicks_pane ? hex_color(0x10B981) : hex_color(0x38BDF8, 0.6f), 1.0f);
+            draw_text("Users: " + std::to_string(room_user_count), font_small, users_btn,
+                      show_nicks_pane ? hex_color(0x10B981) : hex_color(0x38BDF8), DWRITE_TEXT_ALIGNMENT_CENTER);
+            app.button_hits.push_back({users_btn, BTN_TOGGLE_NICKLIST, ""});
 
             if (nd) {
                 std::string full_k = hex_string(nd->pub_key.data(), 32, "");
@@ -4902,8 +4978,16 @@ private:
                   << " | PSK: " << psk_to_hex(psk);
 
             draw_text(c_oss.str(), font_mono_small,
-                      D2D1::RectF(crypto_bar.left + 10, crypto_bar.top, crypto_bar.right - 102, crypto_bar.bottom),
+                      D2D1::RectF(crypto_bar.left + 10, crypto_bar.top, crypto_bar.right - 190, crypto_bar.bottom),
                       hex_color(0x94A3B8));
+
+            // [Users: N] toggle button
+            D2D1_RECT_F users_btn = D2D1::RectF(crypto_bar.right - 186, crypto_bar.top + 4, crypto_bar.right - 102, crypto_bar.bottom - 4);
+            fill_round_rect(users_btn, 5.0f, show_nicks_pane ? hex_color(0x10B981, 0.25f) : hex_color(0x162238));
+            draw_round_rect(users_btn, 5.0f, show_nicks_pane ? hex_color(0x10B981) : hex_color(0x38BDF8, 0.6f), 1.0f);
+            draw_text("Users: " + std::to_string(room_user_count), font_small, users_btn,
+                      show_nicks_pane ? hex_color(0x10B981) : hex_color(0x38BDF8), DWRITE_TEXT_ALIGNMENT_CENTER);
+            app.button_hits.push_back({users_btn, BTN_TOGGLE_NICKLIST, ""});
 
             // [Copy PSK] button
             D2D1_RECT_F copy_btn = D2D1::RectF(crypto_bar.right - 98, crypto_bar.top + 4, crypto_bar.right - 8, crypto_bar.bottom - 4);
@@ -4915,11 +4999,101 @@ private:
             app.button_hits.push_back({copy_btn, BTN_COPY_PSK, psk_to_hex(psk)});
         }
 
-        // 3. Message Feed Scrollback (y + 80 .. y + h - 82)
-        D2D1_RECT_F chat_box = D2D1::RectF(x + 10, y + 80, x + w - 10, y + h - 82);
+        // 3. Message Feed Scrollback + Optional mIRC-Style Room Participant Sidebar (y + 80 .. y + h - 82)
+        const float nick_pane_w = show_nicks_pane ? ((w < 520.0f) ? 152.0f : 184.0f) : 0.0f;
+        const float chat_right_x = show_nicks_pane ? (x + w - 16.0f - nick_pane_w) : (x + w - 10.0f);
+        D2D1_RECT_F chat_box = D2D1::RectF(x + 10, y + 80, chat_right_x, y + h - 82);
         app.chat_view_rect = chat_box;
         fill_round_rect(chat_box, 8.0f, hex_color(0x090D16));
         draw_round_rect(chat_box, 8.0f, hex_color(0x1E293B), 1.0f);
+
+        if (show_nicks_pane) {
+            D2D1_RECT_F nick_box = D2D1::RectF(chat_right_x + 6.0f, y + 80, x + w - 10.0f, y + h - 82);
+            fill_round_rect(nick_box, 8.0f, hex_color(0x0B111E));
+            draw_round_rect(nick_box, 8.0f, hex_color(0x1E293B), 1.0f);
+
+            // Header bar
+            D2D1_RECT_F nhdr = D2D1::RectF(nick_box.left + 4, nick_box.top + 4, nick_box.right - 4, nick_box.top + 26);
+            fill_round_rect(nhdr, 5.0f, hex_color(0x131C2E));
+            draw_text("ROOM USERS (" + std::to_string(room_user_count) + ")", font_small,
+                      D2D1::RectF(nhdr.left + 8, nhdr.top, nhdr.right - 6, nhdr.bottom), hex_color(0x00E5FF));
+
+            float ny = nhdr.bottom + 4.0f;
+            const float nrow_h = 26.0f;
+            const float nmax_y = nick_box.bottom - 20.0f;
+            const uint64_t now_s = now_epoch_secs();
+
+            // Row 0: Self ([YOU])
+            if (ny + nrow_h <= nmax_y) {
+                D2D1_RECT_F sr = D2D1::RectF(nick_box.left + 5, ny, nick_box.right - 5, ny + nrow_h - 2);
+                fill_round_rect(sr, 4.0f, hex_color(0x10B981, 0.14f));
+                draw_round_rect(sr, 4.0f, hex_color(0x10B981, 0.45f), 1.0f);
+                float scy = (sr.top + sr.bottom) * 0.5f;
+                fill_round_rect(D2D1::RectF(sr.left + 5.8f, scy - 3.2f, sr.left + 12.2f, scy + 3.2f), 3.2f, hex_color(0x10B981));
+                draw_text("+" + app.callsign, font_mono_small,
+                          D2D1::RectF(sr.left + 16, sr.top, sr.right - 36, sr.bottom), hex_color(0x10B981));
+                draw_text("YOU", font_mono_small,
+                          D2D1::RectF(sr.right - 34, sr.top, sr.right - 5, sr.bottom),
+                          hex_color(0x34D399), DWRITE_TEXT_ALIGNMENT_TRAILING);
+                ny += nrow_h;
+            }
+
+            // Room participants sorted by recency
+            for (const auto& st : active_tab.nicks) {
+                if (_stricmp(st.callsign.c_str(), app.callsign.c_str()) == 0) continue;
+                if (ny + nrow_h > nmax_y) break;
+
+                D2D1_RECT_F ur = D2D1::RectF(nick_box.left + 5, ny, nick_box.right - 5, ny + nrow_h - 2);
+                bool uhov = pt_in_rect(app.mouse_pt, ur);
+                bool usel = (_stricmp(app.replying_to_user.c_str(), st.callsign.c_str()) == 0) ||
+                            (_stricmp(app.selected_station.c_str(), st.callsign.c_str()) == 0);
+                fill_round_rect(ur, 4.0f, usel ? hex_color(0x00E5FF, 0.20f)
+                                        : uhov ? hex_color(0x1E293B)
+                                               : hex_color(0x0F172A));
+                if (usel || uhov) {
+                    draw_round_rect(ur, 4.0f, usel ? hex_color(0x00E5FF) : hex_color(0x334155), 1.0f);
+                }
+
+                // Online recency dot: green (<15m), amber (<2h), slate (history/mentioned)
+                uint32_t dot_hex = 0x64748B;
+                if (st.last_heard_epoch > 1000 && now_s >= st.last_heard_epoch) {
+                    uint64_t age = now_s - st.last_heard_epoch;
+                    if (age <= 900) dot_hex = 0x10B981;
+                    else if (age <= 7200) dot_hex = 0xFBBF24;
+                }
+                float ucy = (ur.top + ur.bottom) * 0.5f;
+                fill_round_rect(D2D1::RectF(ur.left + 5.8f, ucy - 3.2f, ur.left + 12.2f, ucy + 3.2f), 3.2f, hex_color(dot_hex));
+
+                const auto* nd = app.find_mesh_node(st.callsign);
+                char prefix = (nd && nd->contact_type == 3) ? '@'
+                            : (nd && nd->contact_type == 2) ? '^'
+                                                            : '+';
+                D2D1_COLOR_F ncol = (nd && nd->contact_type == 3) ? hex_color(0xC084FC)
+                                  : (nd && nd->contact_type == 2) ? hex_color(0x38BDF8)
+                                                                  : callsign_color(st.callsign);
+
+                char meta_b[32] = "";
+                if (st.msg_count > 0) {
+                    std::snprintf(meta_b, sizeof(meta_b), "%zum", st.msg_count);
+                } else {
+                    std::snprintf(meta_b, sizeof(meta_b), "ref");
+                }
+
+                draw_text(std::string(1, prefix) + st.callsign, font_mono_small,
+                          D2D1::RectF(ur.left + 16, ur.top, ur.right - 34, ur.bottom), ncol);
+                draw_text(meta_b, font_mono_small,
+                          D2D1::RectF(ur.right - 34, ur.top, ur.right - 5, ur.bottom),
+                          hex_color(0x64748B), DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+                app.nicklist_hits.push_back({ur, 0, st.callsign});
+                ny += nrow_h;
+            }
+
+            // Footer hint
+            draw_text("Tap: @Reply • 2x: DM", font_mono_small,
+                      D2D1::RectF(nick_box.left + 6, nick_box.bottom - 18, nick_box.right - 6, nick_box.bottom - 2),
+                      hex_color(0x64748B), DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
 
         constexpr size_t MAX_ROUTE_LINES = 3;
         auto route_line_count = [=](const ChatMessage& m) -> size_t {
@@ -6325,6 +6499,16 @@ static void handle_left_click(HWND hwnd, POINT pt) {
         }
     }
 
+    // 6b. Check Room Participant / Nicklist rows (single-click/tap replies @[user], double-click opens @DM tab!)
+    for (const auto& hit : g_app->nicklist_hits) {
+        if (D2DRenderer::pt_in_rect(pt, hit.rect)) {
+            g_app->selected_station = hit.payload;
+            g_app->reply_to_user(hit.payload);
+            g_app->active_input = ActiveInputTarget::ChatComposer;
+            return;
+        }
+    }
+
     // 7. Check Heard Station / Mesh System Cards (single-click selects; double-click replies directly!)
     for (const auto& hit : g_app->station_hits) {
         if (D2DRenderer::pt_in_rect(pt, hit.rect)) {
@@ -6552,6 +6736,15 @@ static void handle_left_click(HWND hwnd, POINT pt) {
                 case BTN_MOB_TAB_SNIFFER:  g_app->mobile_tab = 2; break;
                 case BTN_MOB_TAB_CHANNELS: g_app->mobile_tab = 3; break;
                 case BTN_MOB_TAB_RADIO:    g_app->mobile_tab = 4; break;
+                case BTN_TOGGLE_NICKLIST: {
+                    RECT cr{};
+                    GetClientRect(hwnd, &cr);
+                    bool def_open = ((cr.right - cr.left) >= 700);
+                    bool cur_open = (g_app->show_room_nicklist_override == 1) ||
+                                    (g_app->show_room_nicklist_override == 0 && def_open);
+                    g_app->show_room_nicklist_override = cur_open ? -1 : 1;
+                    break;
+                }
             }
             return;
         }
@@ -6562,6 +6755,16 @@ static void handle_left_click(HWND hwnd, POINT pt) {
 
 static void handle_left_double_click(HWND, POINT pt) {
     if (!g_app) return;
+
+    // 0a. Double-clicking any participant in the Room Nicklist opens a direct @NodeName DM tab!
+    for (const auto& hit : g_app->nicklist_hits) {
+        if (D2DRenderer::pt_in_rect(pt, hit.rect)) {
+            g_app->clear_reply_target();
+            g_app->open_dm_tab(hit.payload, false);
+            g_app->active_input = ActiveInputTarget::ChatComposer;
+            return;
+        }
+    }
 
     // 0. Double-clicking a node pin on the Live Map opens a @NodeName Direct Message tab
     if (g_app->center_view == CenterView::Map && D2DRenderer::pt_in_rect(pt, g_app->map_rect) &&
