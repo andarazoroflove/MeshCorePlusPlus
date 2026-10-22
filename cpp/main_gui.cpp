@@ -1035,6 +1035,8 @@ public:
     std::vector<HitRect> ble_menu_hits;
 
     D2D1_RECT_F chat_view_rect{};
+    D2D1_RECT_F nick_view_rect{};
+    int nicklist_scroll = 0;
     D2D1_RECT_F sniffer_view_rect{};
     D2D1_RECT_F nodes_view_rect{};
     POINT mouse_pt{0, 0};
@@ -4922,14 +4924,40 @@ private:
 
         const auto& active_tab = app.tabs[app.active_tab_idx];
         const bool is_console_tab = (active_tab.name == MeshGuiApp::CONSOLE_TAB);
-        size_t room_user_count = 1; // Always includes self
+        const bool is_public_tab = (normalize_channel_name(active_tab.name) == PUBLIC_CHANNEL_NAME);
+
+        // Build unified participant list for this room:
+        // 1. Speakers & @[mentioned] stations in this tab
+        // 2. For Public channel (Slot 0 default on every Companion node), also include all heard Companion/Room stations!
+        std::vector<HeardStation> room_users;
+        room_users.reserve(active_tab.nicks.size() + (is_public_tab ? app.mesh_nodes.size() : 0));
+        auto has_user = [&](const std::string& name) {
+            if (name.empty() || _stricmp(name.c_str(), app.callsign.c_str()) == 0) return true;
+            for (const auto& u : room_users) {
+                if (_stricmp(u.callsign.c_str(), name.c_str()) == 0) return true;
+            }
+            return false;
+        };
         for (const auto& st : active_tab.nicks) {
-            if (_stricmp(st.callsign.c_str(), app.callsign.c_str()) != 0) ++room_user_count;
+            if (!has_user(st.callsign)) room_users.push_back(st);
         }
-        const bool default_nicks_open = (w >= 520.0f);
-        const bool show_nicks_pane = !is_console_tab &&
-                                     ((app.show_room_nicklist_override == 1) ||
-                                      (app.show_room_nicklist_override == 0 && default_nicks_open));
+        if (is_public_tab) {
+            for (const auto& nd : app.mesh_nodes) {
+                if ((nd.contact_type == 1 || nd.contact_type == 3) && !has_user(nd.name)) {
+                    HeardStation hs;
+                    hs.callsign = nd.name;
+                    hs.last_rssi = nd.live_rssi;
+                    hs.last_snr = nd.live_snr;
+                    hs.hops = nd.live_hops;
+                    hs.last_heard_epoch = nd.last_advert_ts;
+                    hs.msg_count = 0;
+                    room_users.push_back(std::move(hs));
+                }
+            }
+        }
+
+        size_t room_user_count = 1 + room_users.size(); // 1 (self) + room_users
+        const bool show_nicks_pane = !is_console_tab && (app.show_room_nicklist_override >= 0);
 
         if (is_console_tab) {
             draw_text("SYSTEM CONSOLE & 256-BUCKET RAINBOW PACKET SNIFFER TELEMETRY",
@@ -4999,8 +5027,8 @@ private:
             app.button_hits.push_back({copy_btn, BTN_COPY_PSK, psk_to_hex(psk)});
         }
 
-        // 3. Message Feed Scrollback + Optional mIRC-Style Room Participant Sidebar (y + 80 .. y + h - 82)
-        const float nick_pane_w = show_nicks_pane ? ((w < 520.0f) ? 152.0f : 184.0f) : 0.0f;
+        // 3. Message Feed Scrollback + mIRC-Style Room Participant Sidebar (y + 80 .. y + h - 82)
+        const float nick_pane_w = show_nicks_pane ? ((w < 520.0f) ? 142.0f : 190.0f) : 0.0f;
         const float chat_right_x = show_nicks_pane ? (x + w - 16.0f - nick_pane_w) : (x + w - 10.0f);
         D2D1_RECT_F chat_box = D2D1::RectF(x + 10, y + 80, chat_right_x, y + h - 82);
         app.chat_view_rect = chat_box;
@@ -5009,6 +5037,7 @@ private:
 
         if (show_nicks_pane) {
             D2D1_RECT_F nick_box = D2D1::RectF(chat_right_x + 6.0f, y + 80, x + w - 10.0f, y + h - 82);
+            app.nick_view_rect = nick_box;
             fill_round_rect(nick_box, 8.0f, hex_color(0x0B111E));
             draw_round_rect(nick_box, 8.0f, hex_color(0x1E293B), 1.0f);
 
@@ -5038,9 +5067,12 @@ private:
                 ny += nrow_h;
             }
 
+            int max_nick_scroll = std::max(0, static_cast<int>(room_users.size()) - 4);
+            app.nicklist_scroll = std::clamp(app.nicklist_scroll, 0, max_nick_scroll);
+
             // Room participants sorted by recency
-            for (const auto& st : active_tab.nicks) {
-                if (_stricmp(st.callsign.c_str(), app.callsign.c_str()) == 0) continue;
+            for (size_t idx = static_cast<size_t>(app.nicklist_scroll); idx < room_users.size(); ++idx) {
+                const auto& st = room_users[idx];
                 if (ny + nrow_h > nmax_y) break;
 
                 D2D1_RECT_F ur = D2D1::RectF(nick_box.left + 5, ny, nick_box.right - 5, ny + nrow_h - 2);
@@ -5054,8 +5086,9 @@ private:
                     draw_round_rect(ur, 4.0f, usel ? hex_color(0x00E5FF) : hex_color(0x334155), 1.0f);
                 }
 
-                // Online recency dot: green (<15m), amber (<2h), slate (history/mentioned)
-                uint32_t dot_hex = 0x64748B;
+                // Online recency dot: green (<15m or heard live RF), amber (<2h), slate (history/contact)
+                const auto* nd = app.find_mesh_node(st.callsign);
+                uint32_t dot_hex = (nd && nd->heard_live_rf) ? 0x10B981 : 0x64748B;
                 if (st.last_heard_epoch > 1000 && now_s >= st.last_heard_epoch) {
                     uint64_t age = now_s - st.last_heard_epoch;
                     if (age <= 900) dot_hex = 0x10B981;
@@ -5064,7 +5097,6 @@ private:
                 float ucy = (ur.top + ur.bottom) * 0.5f;
                 fill_round_rect(D2D1::RectF(ur.left + 5.8f, ucy - 3.2f, ur.left + 12.2f, ucy + 3.2f), 3.2f, hex_color(dot_hex));
 
-                const auto* nd = app.find_mesh_node(st.callsign);
                 char prefix = (nd && nd->contact_type == 3) ? '@'
                             : (nd && nd->contact_type == 2) ? '^'
                                                             : '+';
@@ -5075,8 +5107,8 @@ private:
                 char meta_b[32] = "";
                 if (st.msg_count > 0) {
                     std::snprintf(meta_b, sizeof(meta_b), "%zum", st.msg_count);
-                } else {
-                    std::snprintf(meta_b, sizeof(meta_b), "ref");
+                } else if (nd && nd->heard_live_rf) {
+                    std::snprintf(meta_b, sizeof(meta_b), "live");
                 }
 
                 draw_text(std::string(1, prefix) + st.callsign, font_mono_small,
@@ -5093,6 +5125,8 @@ private:
             draw_text("Tap: @Reply • 2x: DM", font_mono_small,
                       D2D1::RectF(nick_box.left + 6, nick_box.bottom - 18, nick_box.right - 6, nick_box.bottom - 2),
                       hex_color(0x64748B), DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            app.nick_view_rect = D2D1::RectF(0, 0, 0, 0);
         }
 
         constexpr size_t MAX_ROUTE_LINES = 3;
@@ -6737,11 +6771,7 @@ static void handle_left_click(HWND hwnd, POINT pt) {
                 case BTN_MOB_TAB_CHANNELS: g_app->mobile_tab = 3; break;
                 case BTN_MOB_TAB_RADIO:    g_app->mobile_tab = 4; break;
                 case BTN_TOGGLE_NICKLIST: {
-                    RECT cr{};
-                    GetClientRect(hwnd, &cr);
-                    bool def_open = ((cr.right - cr.left) >= 700);
-                    bool cur_open = (g_app->show_room_nicklist_override == 1) ||
-                                    (g_app->show_room_nicklist_override == 0 && def_open);
+                    bool cur_open = (g_app->show_room_nicklist_override >= 0);
                     g_app->show_room_nicklist_override = cur_open ? -1 : 1;
                     break;
                 }
@@ -7029,6 +7059,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     g_app->map_zoom_at(g_app->mouse_pt, delta > 0 ? 1 : -1);
                 } else if (D2DRenderer::pt_in_rect(g_app->mouse_pt, g_app->sniffer_view_rect)) {
                     g_app->sniffer_scroll = std::max(0, g_app->sniffer_scroll - steps);
+                } else if (D2DRenderer::pt_in_rect(g_app->mouse_pt, g_app->nick_view_rect)) {
+                    g_app->nicklist_scroll = std::max(0, g_app->nicklist_scroll - steps);
                 } else if (D2DRenderer::pt_in_rect(g_app->mouse_pt, g_app->nodes_view_rect)) {
                     int max_nd = std::max(0, static_cast<int>(g_app->mesh_nodes.size()) - 5);
                     g_app->nodes_scroll = std::clamp(g_app->nodes_scroll - steps, 0, max_nd);

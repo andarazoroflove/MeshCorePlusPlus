@@ -90,7 +90,7 @@ public class MeshCoreActivity extends Activity {
     private String callsign = "MobileOp";
     private String activeChannel = "Public";
     private int activeMobileTab = 0; // 0=Chat, 1=Nodes, 2=Sniffer, 3=Channels, 4=Radio
-    private boolean showRoomParticipants = false;
+    private boolean showRoomParticipants = true;
 
     // Radio state
     private BluetoothAdapter btAdapter;
@@ -417,7 +417,7 @@ public class MeshCoreActivity extends Activity {
         addChLp.setMargins(0, 0, dp(6), 0);
         channelPillsContainer.addView(btnAddCh, addChLp);
 
-        // Count unique participants in activeChannel (always includes self)
+        // Count unique participants in activeChannel (always includes self + speakers + Public mesh chat nodes)
         final Map<String, Integer> roomNicks = new LinkedHashMap<>();
         List<ChatMsgItem> curMsgs = channelMessages.get(activeChannel);
         if (curMsgs != null) {
@@ -426,6 +426,14 @@ public class MeshCoreActivity extends Activity {
                 if (!m.isSystem && m.sender != null && !m.sender.isEmpty() && !m.sender.equalsIgnoreCase(callsign)) {
                     Integer prev = roomNicks.get(m.sender);
                     roomNicks.put(m.sender, prev == null ? 1 : prev + 1);
+                }
+            }
+        }
+        if ("Public".equalsIgnoreCase(activeChannel)) {
+            for (NodeItem nd : meshNodes.values()) {
+                if ((nd.type == 1 || nd.type == 3) && nd.name != null && !nd.name.isEmpty()
+                        && !nd.name.equalsIgnoreCase(callsign) && !roomNicks.containsKey(nd.name)) {
+                    roomNicks.put(nd.name, 0);
                 }
             }
         }
@@ -445,7 +453,7 @@ public class MeshCoreActivity extends Activity {
             @Override
             public void onClick(View v) {
                 showRoomParticipants = !showRoomParticipants;
-                switchMobileTab(activeMobileTab);
+                renderActiveTab();
             }
         });
         channelPillsContainer.addView(btnUsers, new LinearLayout.LayoutParams(
