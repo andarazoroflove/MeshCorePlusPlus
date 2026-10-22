@@ -453,7 +453,7 @@ public class MeshCoreActivity extends Activity {
             @Override
             public void onClick(View v) {
                 showRoomParticipants = !showRoomParticipants;
-                renderActiveTab();
+                switchMobileTab(activeMobileTab);
             }
         });
         channelPillsContainer.addView(btnUsers, new LinearLayout.LayoutParams(
