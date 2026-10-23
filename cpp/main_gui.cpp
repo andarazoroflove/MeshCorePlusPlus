@@ -5175,17 +5175,17 @@ private:
             draw_text(hdr_lbl, font_small,
                       D2D1::RectF(nhdr.left + 8, nhdr.top, nhdr.right - 6, nhdr.bottom), hex_color(0x00E5FF));
 
-            // Search / Filter Input Box inside ROOM USERS
-            D2D1_RECT_F nf_r = D2D1::RectF(nick_box.left + 4, nhdr.bottom + 3, nick_box.right - 4, nhdr.bottom + 26);
+            // Search / Filter Input Box right at the top of ROOM USERS
+            D2D1_RECT_F nf_r = D2D1::RectF(nick_box.left + 4, nhdr.bottom + 3, nick_box.right - 4, nhdr.bottom + 29);
             bool nf_focused = (app.active_input == ActiveInputTarget::NicklistFilter);
-            fill_round_rect(nf_r, 4.0f, hex_color(0x090D16));
-            draw_round_rect(nf_r, 4.0f, nf_focused ? hex_color(0x00E5FF) : hex_color(0x26354D), 1.1f);
+            fill_round_rect(nf_r, 5.0f, nf_focused ? hex_color(0x112238) : hex_color(0x0D1829));
+            draw_round_rect(nf_r, 5.0f, nf_focused ? hex_color(0x00E5FF) : hex_color(0x38BDF8, 0.75f), nf_focused ? 1.5f : 1.1f);
             std::string nf_disp = app.nicklist_filter.empty()
                                       ? (nf_focused ? "Search: _" : "Search users...")
                                       : (app.nicklist_filter + (nf_focused ? "_" : ""));
             draw_text(nf_disp, font_mono_small,
-                      D2D1::RectF(nf_r.left + 6, nf_r.top, nf_r.right - (app.nicklist_filter.empty() ? 6 : 20), nf_r.bottom),
-                      app.nicklist_filter.empty() && !nf_focused ? hex_color(0x64748B) : hex_color(0xE2E8F0));
+                      D2D1::RectF(nf_r.left + 7, nf_r.top, nf_r.right - (app.nicklist_filter.empty() ? 6 : 20), nf_r.bottom),
+                      app.nicklist_filter.empty() && !nf_focused ? hex_color(0x94A3B8) : hex_color(0xF8FAFC));
             app.button_hits.push_back({nf_r, BTN_NICKLIST_FILTER_BOX, ""});
             if (!app.nicklist_filter.empty()) {
                 D2D1_RECT_F nfc_r = D2D1::RectF(nf_r.right - 20, nf_r.top + 1, nf_r.right - 2, nf_r.bottom - 1);
@@ -5193,7 +5193,7 @@ private:
                 app.button_hits.push_back({nfc_r, BTN_NICKLIST_FILTER_CLEAR, ""});
             }
 
-            float ny = nf_r.bottom + 4.0f;
+            float ny = nf_r.bottom + 5.0f;
             const float nrow_h = 26.0f;
             const float nmax_y = nick_box.bottom - 20.0f;
             const uint64_t now_s = now_epoch_secs();
@@ -5624,6 +5624,10 @@ private:
         fill_round_rect(st_card, 10.0f, hex_color(0x0F172A));
         draw_round_rect(st_card, 10.0f, hex_color(0x1E293B), 1.2f);
 
+        std::string nf_lower = app.nicklist_filter;
+        std::transform(nf_lower.begin(), nf_lower.end(), nf_lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
         const auto& active_tab = app.tabs[app.active_tab_idx];
         if (!app.mesh_nodes.empty()) {
             draw_module_drag_header(app, MOD_PUBLIC_MESH, x, y, w,
@@ -5635,9 +5639,33 @@ private:
             draw_text(count_buf, font_mono_small,
                       D2D1::RectF(x + 12, y + 24, x + w - 12, y + 40), hex_color(0x94A3B8));
 
-            float sy = y + 44.0f;
+            // Search / Filter Input Box inside PUBLIC MESH SYSTEM
+            D2D1_RECT_F nf_r = D2D1::RectF(x + 10, y + 42, x + w - 10, y + 65);
+            bool nf_focused = (app.active_input == ActiveInputTarget::NicklistFilter);
+            fill_round_rect(nf_r, 4.0f, hex_color(0x090D16));
+            draw_round_rect(nf_r, 4.0f, nf_focused ? hex_color(0x00E5FF) : hex_color(0x26354D), 1.1f);
+            std::string nf_disp = app.nicklist_filter.empty()
+                                      ? (nf_focused ? "Search nodes/users: _" : "Search nodes/users...")
+                                      : (app.nicklist_filter + (nf_focused ? "_" : ""));
+            draw_text(nf_disp, font_mono_small,
+                      D2D1::RectF(nf_r.left + 8, nf_r.top, nf_r.right - (app.nicklist_filter.empty() ? 8 : 22), nf_r.bottom),
+                      app.nicklist_filter.empty() && !nf_focused ? hex_color(0x64748B) : hex_color(0xE2E8F0));
+            app.button_hits.push_back({nf_r, BTN_NICKLIST_FILTER_BOX, ""});
+            if (!app.nicklist_filter.empty()) {
+                D2D1_RECT_F nfc_r = D2D1::RectF(nf_r.right - 22, nf_r.top + 1, nf_r.right - 2, nf_r.bottom - 1);
+                draw_text("x", font_small, nfc_r, hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
+                app.button_hits.push_back({nfc_r, BTN_NICKLIST_FILTER_CLEAR, ""});
+            }
+
+            float sy = y + 69.0f;
             int idx = 0;
             for (const auto& nd : app.mesh_nodes) {
+                if (!nf_lower.empty()) {
+                    std::string nl = nd.name;
+                    std::transform(nl.begin(), nl.end(), nl.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (nl.find(nf_lower) == std::string::npos) continue;
+                }
                 if (idx++ < app.nodes_scroll) continue;
                 if (sy + 42.0f > st_card.bottom - 6.0f) break;
 
@@ -5701,12 +5729,36 @@ private:
             draw_module_drag_header(app, MOD_PUBLIC_MESH, x, y, w,
                                     "HEARD STATIONS (" + std::to_string(active_tab.nicks.size()) + ")", 0xF472B6);
 
-            float sy = y + 32.0f;
+            // Search / Filter Input Box inside HEARD STATIONS
+            D2D1_RECT_F nf_r = D2D1::RectF(x + 10, y + 30, x + w - 10, y + 54);
+            bool nf_focused = (app.active_input == ActiveInputTarget::NicklistFilter);
+            fill_round_rect(nf_r, 5.0f, nf_focused ? hex_color(0x112238) : hex_color(0x0D1829));
+            draw_round_rect(nf_r, 5.0f, nf_focused ? hex_color(0x00E5FF) : hex_color(0x38BDF8, 0.75f), nf_focused ? 1.5f : 1.1f);
+            std::string nf_disp = app.nicklist_filter.empty()
+                                      ? (nf_focused ? "Search stations: _" : "Search stations...")
+                                      : (app.nicklist_filter + (nf_focused ? "_" : ""));
+            draw_text(nf_disp, font_mono_small,
+                      D2D1::RectF(nf_r.left + 8, nf_r.top, nf_r.right - (app.nicklist_filter.empty() ? 8 : 22), nf_r.bottom),
+                      app.nicklist_filter.empty() && !nf_focused ? hex_color(0x94A3B8) : hex_color(0xF8FAFC));
+            app.button_hits.push_back({nf_r, BTN_NICKLIST_FILTER_BOX, ""});
+            if (!app.nicklist_filter.empty()) {
+                D2D1_RECT_F nfc_r = D2D1::RectF(nf_r.right - 22, nf_r.top + 1, nf_r.right - 2, nf_r.bottom - 1);
+                draw_text("x", font_small, nfc_r, hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
+                app.button_hits.push_back({nfc_r, BTN_NICKLIST_FILTER_CLEAR, ""});
+            }
+
+            float sy = y + 59.0f;
             if (active_tab.nicks.empty()) {
                 draw_text("Syncing Public MeshCore nodes...", font_ui,
                           D2D1::RectF(x + 14, sy + 8, x + w - 14, sy + 36), hex_color(0x64748B));
             } else {
                 for (const auto& st : active_tab.nicks) {
+                    if (!nf_lower.empty()) {
+                        std::string sl = st.callsign;
+                        std::transform(sl.begin(), sl.end(), sl.begin(),
+                                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        if (sl.find(nf_lower) == std::string::npos) continue;
+                    }
                     if (sy + 44.0f > st_card.bottom - 6.0f) break;
                     D2D1_RECT_F sr = D2D1::RectF(x + 10, sy, x + w - 10, sy + 42.0f);
                     bool shov = pt_in_rect(app.mouse_pt, sr);
@@ -7273,14 +7325,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_KEYDOWN:
             if (g_app) {
                 bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                if (ctrl && wParam == 'F') {
+                    g_app->active_input = ActiveInputTarget::NicklistFilter;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
                 if (ctrl && wParam == 'V') {
                     std::string clip = get_clipboard_text(hwnd);
+                    std::string* dst = &g_app->chat_input;
+                    if (g_app->active_input == ActiveInputTarget::SnifferFilter) dst = &g_app->sniffer_filter;
+                    else if (g_app->active_input == ActiveInputTarget::NicklistFilter) dst = &g_app->nicklist_filter;
                     for (char c : clip) {
                         if (c >= 0x20 && c != 0x7F) {
-                            g_app->chat_input.push_back(c);
+                            dst->push_back(c);
                         }
                     }
                     g_app->chat_cursor = g_app->chat_input.size();
+                    if (g_app->active_input == ActiveInputTarget::NicklistFilter) g_app->nicklist_scroll = 0;
+                    if (g_app->active_input == ActiveInputTarget::SnifferFilter) g_app->sniffer_scroll = 0;
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
@@ -7477,7 +7539,7 @@ static const char kEmbeddedMacInfoPlist[] =
     "<plist version=\"1.0\">\n"
     "<dict>\n"
     "  <key>CFBundleIdentifier</key>\n"
-    "  <string>com.meshcore.plusplus</string>\n"
+    "  <string>io.meshcore.plusplus</string>\n"
     "  <key>CFBundleName</key>\n"
     "  <string>MeshCore++</string>\n"
     "  <key>NSBluetoothAlwaysUsageDescription</key>\n"
@@ -7969,6 +8031,9 @@ static void mac_flush_display(id view) {
 }
 
 static void mac_view_mouse_down(id self, SEL, id event) {
+    if (g_mac_win.ns_window) {
+        msg_send<ObjcBool>(g_mac_win.ns_window, sel_registerName("makeFirstResponder:"), self);
+    }
     CGPoint pt = event_pt_in_view(self, event);
     LPARAM lp = MAKELPARAM_MAC(static_cast<int>(pt.x), static_cast<int>(pt.y));
     long clicks = msg_send<long>(event, sel_registerName("clickCount"));
@@ -8014,6 +8079,12 @@ static void mac_view_key_down(id self, SEL, id event) {
     unsigned short key_code = msg_send<unsigned short>(event, sel_registerName("keyCode"));
 
     if (g_mac_cmd_down) {
+        if (key_code == 3) { // Cmd+F -> Focus Room Users Search Box
+            WndProc(&g_mac_win, WM_KEYDOWN, 'F', 0);
+            g_mac_cmd_down = false;
+            mac_flush_display(self);
+            return;
+        }
         if (key_code == 8) { // Cmd+C
             WndProc(&g_mac_win, WM_KEYDOWN, 'C', 0);
             g_mac_cmd_down = false;
@@ -8050,7 +8121,7 @@ static void mac_view_key_down(id self, SEL, id event) {
         WndProc(&g_mac_win, WM_KEYDOWN, VK_PRIOR, 0);
     } else if (key_code == 121) { // PageDown
         WndProc(&g_mac_win, WM_KEYDOWN, VK_NEXT, 0);
-    } else if (key_code == 51) { // Backspace
+    } else if (key_code == 51 || key_code == 117) { // Backspace (51) or Forward Delete (117)
         WndProc(&g_mac_win, WM_CHAR, static_cast<WPARAM>('\b'), 0);
     } else {
         id chars = msg_send<id>(event, sel_registerName("characters"));
@@ -8099,30 +8170,37 @@ static void mac_ensure_native_codesign(char** argv) {
     auto fsize = std::filesystem::file_size(ep, ec);
     if (ec) return;
 
-    std::filesystem::path data_dir = std::filesystem::path(from_wide(exe_dir()));
-    std::filesystem::create_directories(data_dir, ec);
-    std::filesystem::path marker = data_dir / (".codesigned_v4_" + std::to_string(fsize));
-    if (std::filesystem::exists(marker, ec)) return;
-
     // Determine whether we are running inside MeshCore++.app/Contents/MacOS/MeshCore++
     std::filesystem::path sign_target = ep;
+    bool is_app_bundle = false;
     if (ep.parent_path().filename() == "MacOS" &&
         ep.parent_path().parent_path().filename() == "Contents" &&
         ep.parent_path().parent_path().parent_path().extension() == ".app") {
         sign_target = ep.parent_path().parent_path().parent_path();
+        is_app_bundle = true;
     }
+
+    std::filesystem::path data_dir = std::filesystem::path(from_wide(exe_dir()));
+    std::filesystem::create_directories(data_dir, ec);
+
+    // Store marker inside the .app bundle itself (Contents/.codesigned_v6_<size>) so every freshly
+    // downloaded/unzipped MeshCore++.app gets signed on first launch, and never re-resets TCC after!
+    std::filesystem::path marker_dir = is_app_bundle ? (sign_target / "Contents") : data_dir;
+    std::filesystem::path marker = marker_dir / (".codesigned_v6_" + std::to_string(fsize));
+    if (std::filesystem::exists(marker, ec)) return;
 
     std::string target_str = sign_target.string();
     std::string cmd = "/usr/bin/xattr -cr \"" + target_str + "\" >/dev/null 2>&1; "
-                      "/usr/bin/codesign --force --deep --sign - \"" + target_str + "\" >/dev/null 2>&1; "
-                      "/usr/bin/tccutil reset Bluetooth com.meshcore.plusplus >/dev/null 2>&1; "
-                      "/usr/bin/tccutil reset Bluetooth io.meshcore.plusplus >/dev/null 2>&1";
+                      "/usr/bin/codesign --force --deep --identifier io.meshcore.plusplus --sign - \"" + target_str + "\" >/dev/null 2>&1; "
+                      "/usr/bin/tccutil reset Bluetooth io.meshcore.plusplus >/dev/null 2>&1; "
+                      "/usr/bin/tccutil reset Bluetooth com.meshcore.plusplus >/dev/null 2>&1";
     std::system(cmd.c_str());
 
-    // Record the new post-codesign file size so subsequent launches start immediately without resetting TCC
+    // Record the new post-codesign file size inside the bundle (and fallback data_dir) so subsequent launches
+    // start immediately without resetting the user's granted Bluetooth TCC permission!
     auto new_fsize = std::filesystem::file_size(ep, ec);
     {
-        std::ofstream mf(data_dir / (".codesigned_v4_" + std::to_string(new_fsize ? new_fsize : fsize)));
+        std::ofstream mf(marker_dir / (".codesigned_v6_" + std::to_string(new_fsize ? new_fsize : fsize)));
         mf << "signed\n";
     }
     {
