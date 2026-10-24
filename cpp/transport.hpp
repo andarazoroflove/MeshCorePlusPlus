@@ -607,7 +607,7 @@ inline void mac_ble_did_update_value(id, SEL, id, id characteristic, id error) {
     uint8_t code0 = ptr[0];
     if (len >= 4 && code0 == FRAME_INBOUND_MAGIC) code0 = ptr[3];
     g_mac_ble.last_rx_code = code0;
-    if (code0 == RESP_CODE_OK) ++g_mac_ble.ok_seq;
+    if (code0 == RESP_CODE_OK || code0 == RESP_SENT) ++g_mac_ble.ok_seq;
     else if (code0 == RESP_CODE_ERR) ++g_mac_ble.err_seq;
 }
 
@@ -967,15 +967,24 @@ private:
     // ========================================================================
     void serial_loop(DetectedSerialPort port_info) {
 #ifdef _WIN32
-        std::string dev_path = "\\\\.\\" + port_info.port_name;
+        int open_failures = 0;
 
         while (running_) {
+            std::string dev_path = "\\\\.\\" + port_info.port_name;
             push_log("[SERIAL] Opening " + port_info.port_name + " (" + port_info.friendly_name + ") @ 115200 baud...");
 
             HANDLE hSerial = CreateFileA(dev_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                          OPEN_EXISTING, 0, nullptr);
             if (hSerial == INVALID_HANDLE_VALUE) {
                 DWORD err = GetLastError();
+                if (++open_failures >= 3) {
+                    // If USB re-enumerated onto a new COM port after a hub/power reset, auto-discover the new port
+                    auto fresh = detect_serial_ports();
+                    for (const auto& p : fresh) {
+                        if (p.is_meshcore_candidate) { port_info = p; break; }
+                    }
+                    open_failures = 0;
+                }
                 push_log("[SERIAL] Cannot open " + port_info.port_name + " (Error " + std::to_string(err) + "). Retrying in 1.5s...");
                 push_status("PORT BUSY / RETRYING", false, false);
                 for (int i = 0; i < 15 && running_; ++i) {
@@ -983,6 +992,7 @@ private:
                 }
                 continue;
             }
+            open_failures = 0;
 
             DCB dcb{};
             dcb.DCBlength = sizeof(DCB);
@@ -999,39 +1009,58 @@ private:
             EscapeCommFunction(hSerial, CLRDTR);
             EscapeCommFunction(hSerial, CLRRTS);
 
-            // Balanced serial timeouts: 20ms inter-byte, 80ms total wait
+            // Balanced serial timeouts: 20ms inter-byte, 80ms total wait, 150ms write timeout
             COMMTIMEOUTS timeouts{};
             timeouts.ReadIntervalTimeout         = 20;
             timeouts.ReadTotalTimeoutConstant    = 80;
             timeouts.ReadTotalTimeoutMultiplier  = 0;
-            timeouts.WriteTotalTimeoutConstant   = 100;
+            timeouts.WriteTotalTimeoutConstant   = 150;
             timeouts.WriteTotalTimeoutMultiplier = 0;
             SetCommTimeouts(hSerial, &timeouts);
 
             PurgeComm(hSerial, PURGE_RXCLEAR | PURGE_TXCLEAR);
 
-            auto write_framed = [&](const std::vector<uint8_t>& payload) {
+            bool connection_alive = true;
+            bool last_rx_got_ok = false;
+            bool last_rx_got_err = false;
+            auto last_any_rx_t = std::chrono::steady_clock::now();
+
+            auto write_framed = [&](const std::vector<uint8_t>& payload) -> bool {
+                if (!connection_alive || !running_) return false;
                 auto framed = encode_serial_frame(payload);
                 DWORD written = 0;
-                WriteFile(hSerial, framed.data(), static_cast<DWORD>(framed.size()), &written, nullptr);
+                BOOL wok = WriteFile(hSerial, framed.data(), static_cast<DWORD>(framed.size()), &written, nullptr);
+                if (!wok || written != static_cast<DWORD>(framed.size())) {
+                    DWORD err = GetLastError();
+                    DWORD comm_err = 0;
+                    COMSTAT cstat{};
+                    ClearCommError(hSerial, &comm_err, &cstat);
+                    PurgeComm(hSerial, PURGE_TXABORT | PURGE_TXCLEAR);
+                    if (!wok && (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_OPERATION_ABORTED ||
+                                 err == ERROR_INVALID_HANDLE || err == ERROR_BAD_COMMAND ||
+                                 err == ERROR_ACCESS_DENIED || err == ERROR_GEN_FAILURE)) {
+                        connection_alive = false;
+                        push_log("[SERIAL] Write failed — serial port disconnected (Error " + std::to_string(err) + "). Reconnecting...");
+                        push_status("RADIO DISCONNECTED", false, false);
+                        return false;
+                    }
+                }
                 MeshEvent tx_ev;
                 tx_ev.type = EventType::RawTx;
                 tx_ev.tx_payload = payload;
                 push_event(tx_ev);
+                return written == static_cast<DWORD>(framed.size());
             };
 
             FrameParser parser;
             uint8_t read_buf[1024];
-
-            bool connection_alive = true;
-            bool last_rx_got_ok = false;
-            bool last_rx_got_err = false;
 
             auto drain_serial_rx = [&](int wait_ms) -> bool {
                 bool got_any_frame = false;
                 std::string raw_ascii;
                 auto start_t = std::chrono::steady_clock::now();
                 do {
+                    if (!running_ || !connection_alive) break;
                     DWORD bytes_read = 0;
                     BOOL ok = ReadFile(hSerial, read_buf, sizeof(read_buf), &bytes_read, nullptr);
                     if (!ok) {
@@ -1044,13 +1073,17 @@ private:
                             push_status("RADIO DISCONNECTED", false, false);
                             break;
                         }
+                        DWORD comm_err = 0;
+                        COMSTAT cstat{};
+                        ClearCommError(hSerial, &comm_err, &cstat);
                         std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     } else if (bytes_read > 0) {
+                        last_any_rx_t = std::chrono::steady_clock::now();
                         raw_ascii.append(reinterpret_cast<const char*>(read_buf), bytes_read);
                         for (const auto& payload : parser.feed(read_buf, bytes_read)) {
                             got_any_frame = true;
                             if (!payload.empty()) {
-                                if (payload[0] == RESP_CODE_OK) last_rx_got_ok = true;
+                                if (payload[0] == RESP_CODE_OK || payload[0] == RESP_SENT) last_rx_got_ok = true;
                                 else if (payload[0] == RESP_CODE_ERR) last_rx_got_err = true;
                             }
                             if (auto pkt = parse_companion_payload(payload)) {
@@ -1093,20 +1126,22 @@ private:
             push_log("[SERIAL] Handshaking with MeshCore Companion radio on " + port_info.port_name + "...");
 
             write_framed(build_cmd_device_query());
-            if (!drain_serial_rx(400)) {
-                // Retry once
+            if (!drain_serial_rx(400) && running_ && connection_alive) {
                 write_framed(build_cmd_device_query());
                 drain_serial_rx(400);
             }
 
             write_framed(build_cmd_app_start("MeshCore++"));
-            drain_serial_rx(250);
+            drain_serial_rx(220);
+
+            write_framed(build_cmd_set_device_time(static_cast<uint32_t>(std::time(nullptr))));
+            drain_serial_rx(120);
 
             write_framed(build_cmd_get_bat());
             drain_serial_rx(150);
 
             // Read all 8 active hardware channel slots from the radio
-            for (uint8_t slot = 0; slot < NUM_HW_CHANNEL_SLOTS && running_; ++slot) {
+            for (uint8_t slot = 0; slot < NUM_HW_CHANNEL_SLOTS && running_ && connection_alive; ++slot) {
                 write_framed(build_cmd_get_channel(slot));
                 drain_serial_rx(120);
             }
@@ -1120,12 +1155,14 @@ private:
             write_framed(build_cmd_sync_next_message());
 
             auto last_bat_poll = std::chrono::steady_clock::now();
+            auto last_clock_sync = std::chrono::steady_clock::now();
+            bool probe_sent = false;
 
             while (running_ && connection_alive) {
                 drain_serial_rx(30);
 
                 OutboundCmd cmd;
-                while (pop_cmd(cmd)) {
+                while (running_ && connection_alive && pop_cmd(cmd)) {
                     if (!cmd.raw_payload.empty()) {
                         last_bat_poll = std::chrono::steady_clock::now();
                         last_rx_got_ok = false;
@@ -1133,34 +1170,81 @@ private:
                         write_framed(cmd.raw_payload);
                         drain_serial_rx(cmd.kind == OutboundCmd::Kind::SyncSlot ? 220 : 180);
 
-                        if ((cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) &&
-                            !last_rx_got_ok && !last_rx_got_err) {
+                        bool is_user_tx = (cmd.kind == OutboundCmd::Kind::SendMonoImg ||
+                                           cmd.kind == OutboundCmd::Kind::SendMsg ||
+                                           cmd.kind == OutboundCmd::Kind::SendDirectMsg);
+                        if (is_user_tx && !last_rx_got_ok && !last_rx_got_err) {
                             drain_serial_rx(220);
                         }
-                        if ((cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) &&
-                            (!last_rx_got_ok || last_rx_got_err)) {
-                            if (cmd.slot_idx > 0 && !cmd.channel_name.empty()) {
-                                write_framed(build_cmd_set_channel(cmd.slot_idx, cmd.channel_name, derive_psk(cmd.channel_name)));
-                                drain_serial_rx(220);
+                        if (is_user_tx && (!last_rx_got_ok || last_rx_got_err)) {
+                            // Self-heal companion session, RTC clock, and channel slot before retrying TX
+                            uint32_t now_ts = static_cast<uint32_t>(std::time(nullptr));
+                            write_framed(build_cmd_app_start("MeshCore++"));
+                            drain_serial_rx(120);
+                            write_framed(build_cmd_set_device_time(now_ts));
+                            drain_serial_rx(100);
+
+                            if (cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) {
+                                std::string ch_name = cmd.channel_name.empty() ? PUBLIC_CHANNEL_NAME : cmd.channel_name;
+                                auto ch_psk = (cmd.slot_idx == 0) ? PUBLIC_CHANNEL_PSK : derive_psk(ch_name);
+                                write_framed(build_cmd_set_channel(cmd.slot_idx, ch_name, ch_psk));
+                                drain_serial_rx(180);
                             }
-                            uint32_t retry_ts = static_cast<uint32_t>(std::time(nullptr)) + 1u;
+
+                            last_rx_got_ok = false;
+                            last_rx_got_err = false;
+                            uint32_t retry_ts = now_ts + 1u;
                             std::vector<uint8_t> retry_payload =
                                 (cmd.kind == OutboundCmd::Kind::SendMonoImg)
                                     ? build_cmd_send_channel_mono_img(cmd.slot_idx, retry_ts, cmd.mono_bits)
+                                : (cmd.kind == OutboundCmd::Kind::SendDirectMsg)
+                                    ? build_cmd_send_txt_msg(cmd.pubkey_prefix, retry_ts, cmd.text, cmd.txt_type, 1)
                                     : build_cmd_send_channel_txt_msg(cmd.slot_idx, retry_ts, cmd.text);
                             write_framed(retry_payload);
-                            drain_serial_rx(220);
+                            drain_serial_rx(260);
+
+                            if (!last_rx_got_ok && !last_rx_got_err) {
+                                // Serial handle is unresponsive: preserve message at front of queue & reset port!
+                                push_log("[WATCHDOG] Radio did not acknowledge TX — resetting serial connection & re-sending...");
+                                requeue_cmd_front(cmd);
+                                connection_alive = false;
+                                break;
+                            }
                         }
                     }
                 }
 
                 auto now = std::chrono::steady_clock::now();
                 if (!has_pending_cmd() &&
-                    std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 30) {
+                    std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 25) {
                     last_bat_poll = now;
+                    // Every 10 minutes, refresh companion session & RTC clock so multi-day runs never drift
+                    if (std::chrono::duration_cast<std::chrono::minutes>(now - last_clock_sync).count() >= 10) {
+                        last_clock_sync = now;
+                        write_framed(build_cmd_app_start("MeshCore++"));
+                        drain_serial_rx(80);
+                        write_framed(build_cmd_set_device_time(static_cast<uint32_t>(std::time(nullptr))));
+                        drain_serial_rx(80);
+                    }
                     write_framed(build_cmd_get_bat());
-                    drain_serial_rx(80);
+                    drain_serial_rx(100);
                     write_framed(build_cmd_sync_next_message());
+                    drain_serial_rx(80);
+
+                    auto silence_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - last_any_rx_t).count();
+                    if (silence_secs >= 65) {
+                        push_log("[WATCHDOG] No response from radio for " + std::to_string(silence_secs) +
+                                 "s — auto-resetting serial port & re-handshaking...");
+                        connection_alive = false;
+                        break;
+                    } else if (silence_secs >= 30 && !probe_sent) {
+                        probe_sent = true;
+                        write_framed(build_cmd_device_query());
+                        drain_serial_rx(150);
+                    } else if (silence_secs < 30) {
+                        probe_sent = false;
+                    }
                 }
             }
 
@@ -1169,13 +1253,21 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         }
 #elif defined(__APPLE__)
-        std::string dev_path = port_info.port_name;
-        if (dev_path.rfind("/dev/", 0) != 0) dev_path = "/dev/" + dev_path;
+        int open_failures = 0;
 
         while (running_) {
+            std::string dev_path = port_info.port_name;
+            if (dev_path.rfind("/dev/", 0) != 0) dev_path = "/dev/" + dev_path;
             push_log("[SERIAL] Opening " + dev_path + " (" + port_info.friendly_name + ") @ 115200 baud...");
             int fd = open(dev_path.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
             if (fd < 0) {
+                if (++open_failures >= 3) {
+                    auto fresh = detect_serial_ports();
+                    for (const auto& p : fresh) {
+                        if (p.is_meshcore_candidate) { port_info = p; break; }
+                    }
+                    open_failures = 0;
+                }
                 push_log("[SERIAL] Cannot open " + dev_path + ". Retrying in 1.5s...");
                 push_status("PORT BUSY / RETRYING", false, false);
                 for (int i = 0; i < 15 && running_; ++i) {
@@ -1183,6 +1275,7 @@ private:
                 }
                 continue;
             }
+            open_failures = 0;
 
             struct termios tty{};
             if (tcgetattr(fd, &tty) == 0) {
@@ -1199,31 +1292,46 @@ private:
             ioctl(fd, TIOCMBIC, &modem_bits);
             tcflush(fd, TCIOFLUSH);
 
-            auto write_framed = [&](const std::vector<uint8_t>& payload) {
+            bool connection_alive = true;
+            bool last_rx_got_ok = false;
+            bool last_rx_got_err = false;
+            auto last_any_rx_t = std::chrono::steady_clock::now();
+
+            auto write_framed = [&](const std::vector<uint8_t>& payload) -> bool {
+                if (!connection_alive || !running_) return false;
                 auto framed = encode_serial_frame(payload);
-                (void)write(fd, framed.data(), framed.size());
+                ssize_t w = write(fd, framed.data(), framed.size());
+                if (w < 0) {
+                    int e = errno;
+                    if (e != EAGAIN && e != EWOULDBLOCK && e != EINTR) {
+                        connection_alive = false;
+                        push_log("[SERIAL] Write error on " + dev_path + " (errno=" + std::to_string(e) + "). Reconnecting...");
+                        push_status("RADIO DISCONNECTED", false, false);
+                        return false;
+                    }
+                }
                 MeshEvent tx_ev;
                 tx_ev.type = EventType::RawTx;
                 tx_ev.tx_payload = payload;
                 push_event(tx_ev);
+                return w == static_cast<ssize_t>(framed.size());
             };
 
             FrameParser parser;
             uint8_t read_buf[1024];
-            bool connection_alive = true;
-            bool last_rx_got_ok = false;
-            bool last_rx_got_err = false;
 
             auto drain_serial_rx = [&](int wait_ms) -> bool {
                 bool got_any_frame = false;
                 auto start_t = std::chrono::steady_clock::now();
                 do {
+                    if (!running_ || !connection_alive) break;
                     ssize_t n = read(fd, read_buf, sizeof(read_buf));
                     if (n > 0) {
+                        last_any_rx_t = std::chrono::steady_clock::now();
                         for (const auto& payload : parser.feed(read_buf, static_cast<size_t>(n))) {
                             got_any_frame = true;
                             if (!payload.empty()) {
-                                if (payload[0] == RESP_CODE_OK) last_rx_got_ok = true;
+                                if (payload[0] == RESP_CODE_OK || payload[0] == RESP_SENT) last_rx_got_ok = true;
                                 else if (payload[0] == RESP_CODE_ERR) last_rx_got_err = true;
                             }
                             if (auto pkt = parse_companion_payload(payload)) {
@@ -1240,7 +1348,23 @@ private:
                                 }
                             }
                         }
+                    } else if (n < 0) {
+                        int e = errno;
+                        if (e != EAGAIN && e != EWOULDBLOCK && e != EINTR) {
+                            connection_alive = false;
+                            push_log("[SERIAL] Serial device disconnected on " + dev_path + " (errno=" + std::to_string(e) + "). Reconnecting...");
+                            push_status("RADIO DISCONNECTED", false, false);
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     } else {
+                        struct stat st_buf{};
+                        if (stat(dev_path.c_str(), &st_buf) != 0) {
+                            connection_alive = false;
+                            push_log("[SERIAL] USB device node " + dev_path + " unplugged. Reconnecting...");
+                            push_status("RADIO DISCONNECTED", false, false);
+                            break;
+                        }
                         std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     }
                 } while (running_ && connection_alive &&
@@ -1253,15 +1377,17 @@ private:
             push_log("[SERIAL] Handshaking with MeshCore Companion radio on " + dev_path + "...");
 
             write_framed(build_cmd_device_query());
-            if (!drain_serial_rx(400)) {
+            if (!drain_serial_rx(400) && running_ && connection_alive) {
                 write_framed(build_cmd_device_query());
                 drain_serial_rx(400);
             }
             write_framed(build_cmd_app_start("MeshCore++"));
-            drain_serial_rx(250);
+            drain_serial_rx(220);
+            write_framed(build_cmd_set_device_time(static_cast<uint32_t>(std::time(nullptr))));
+            drain_serial_rx(120);
             write_framed(build_cmd_get_bat());
             drain_serial_rx(150);
-            for (uint8_t slot = 0; slot < NUM_HW_CHANNEL_SLOTS && running_; ++slot) {
+            for (uint8_t slot = 0; slot < NUM_HW_CHANNEL_SLOTS && running_ && connection_alive; ++slot) {
                 write_framed(build_cmd_get_channel(slot));
                 drain_serial_rx(120);
             }
@@ -1271,10 +1397,13 @@ private:
             write_framed(build_cmd_sync_next_message());
 
             auto last_bat_poll = std::chrono::steady_clock::now();
+            auto last_clock_sync = std::chrono::steady_clock::now();
+            bool probe_sent = false;
+
             while (running_ && connection_alive) {
                 drain_serial_rx(30);
                 OutboundCmd cmd;
-                while (pop_cmd(cmd)) {
+                while (running_ && connection_alive && pop_cmd(cmd)) {
                     if (!cmd.raw_payload.empty()) {
                         last_bat_poll = std::chrono::steady_clock::now();
                         last_rx_got_ok = false;
@@ -1282,33 +1411,77 @@ private:
                         write_framed(cmd.raw_payload);
                         drain_serial_rx(cmd.kind == OutboundCmd::Kind::SyncSlot ? 220 : 180);
 
-                        if ((cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) &&
-                            !last_rx_got_ok && !last_rx_got_err) {
+                        bool is_user_tx = (cmd.kind == OutboundCmd::Kind::SendMonoImg ||
+                                           cmd.kind == OutboundCmd::Kind::SendMsg ||
+                                           cmd.kind == OutboundCmd::Kind::SendDirectMsg);
+                        if (is_user_tx && !last_rx_got_ok && !last_rx_got_err) {
                             drain_serial_rx(220);
                         }
-                        if ((cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) &&
-                            (!last_rx_got_ok || last_rx_got_err)) {
-                            if (cmd.slot_idx > 0 && !cmd.channel_name.empty()) {
-                                write_framed(build_cmd_set_channel(cmd.slot_idx, cmd.channel_name, derive_psk(cmd.channel_name)));
-                                drain_serial_rx(220);
+                        if (is_user_tx && (!last_rx_got_ok || last_rx_got_err)) {
+                            uint32_t now_ts = static_cast<uint32_t>(std::time(nullptr));
+                            write_framed(build_cmd_app_start("MeshCore++"));
+                            drain_serial_rx(120);
+                            write_framed(build_cmd_set_device_time(now_ts));
+                            drain_serial_rx(100);
+
+                            if (cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) {
+                                std::string ch_name = cmd.channel_name.empty() ? PUBLIC_CHANNEL_NAME : cmd.channel_name;
+                                auto ch_psk = (cmd.slot_idx == 0) ? PUBLIC_CHANNEL_PSK : derive_psk(ch_name);
+                                write_framed(build_cmd_set_channel(cmd.slot_idx, ch_name, ch_psk));
+                                drain_serial_rx(180);
                             }
-                            uint32_t retry_ts = static_cast<uint32_t>(std::time(nullptr)) + 1u;
+
+                            last_rx_got_ok = false;
+                            last_rx_got_err = false;
+                            uint32_t retry_ts = now_ts + 1u;
                             std::vector<uint8_t> retry_payload =
                                 (cmd.kind == OutboundCmd::Kind::SendMonoImg)
                                     ? build_cmd_send_channel_mono_img(cmd.slot_idx, retry_ts, cmd.mono_bits)
+                                : (cmd.kind == OutboundCmd::Kind::SendDirectMsg)
+                                    ? build_cmd_send_txt_msg(cmd.pubkey_prefix, retry_ts, cmd.text, cmd.txt_type, 1)
                                     : build_cmd_send_channel_txt_msg(cmd.slot_idx, retry_ts, cmd.text);
                             write_framed(retry_payload);
-                            drain_serial_rx(220);
+                            drain_serial_rx(260);
+
+                            if (!last_rx_got_ok && !last_rx_got_err) {
+                                push_log("[WATCHDOG] Radio did not acknowledge TX — resetting serial connection & re-sending...");
+                                requeue_cmd_front(cmd);
+                                connection_alive = false;
+                                break;
+                            }
                         }
                     }
                 }
                 auto now = std::chrono::steady_clock::now();
                 if (!has_pending_cmd() &&
-                    std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 30) {
+                    std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 25) {
                     last_bat_poll = now;
+                    if (std::chrono::duration_cast<std::chrono::minutes>(now - last_clock_sync).count() >= 10) {
+                        last_clock_sync = now;
+                        write_framed(build_cmd_app_start("MeshCore++"));
+                        drain_serial_rx(80);
+                        write_framed(build_cmd_set_device_time(static_cast<uint32_t>(std::time(nullptr))));
+                        drain_serial_rx(80);
+                    }
                     write_framed(build_cmd_get_bat());
-                    drain_serial_rx(80);
+                    drain_serial_rx(100);
                     write_framed(build_cmd_sync_next_message());
+                    drain_serial_rx(80);
+
+                    auto silence_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - last_any_rx_t).count();
+                    if (silence_secs >= 65) {
+                        push_log("[WATCHDOG] No response from radio for " + std::to_string(silence_secs) +
+                                 "s — auto-resetting serial port & re-handshaking...");
+                        connection_alive = false;
+                        break;
+                    } else if (silence_secs >= 30 && !probe_sent) {
+                        probe_sent = true;
+                        write_framed(build_cmd_device_query());
+                        drain_serial_rx(150);
+                    } else if (silence_secs < 30) {
+                        probe_sent = false;
+                    }
                 }
             }
             close(fd);
@@ -1578,11 +1751,17 @@ private:
         int handshake_retries = 0;
         auto last_handshake_t = std::chrono::steady_clock::now();
         auto last_bat_poll = std::chrono::steady_clock::now();
+        auto last_any_rx_t = std::chrono::steady_clock::now();
+        auto last_clock_sync = std::chrono::steady_clock::now();
 
         auto send_full_ble_handshake = [&]() {
             push_log("[BLE] Handshaking with MeshCore BLE Companion node...");
             write_ble_raw(build_cmd_device_query(), 260);
             write_ble_raw(build_cmd_app_start("MeshCore++"), 260);
+            uint32_t now_ts = static_cast<uint32_t>(std::time(nullptr));
+            if (now_ts > 1700000000u) {
+                write_ble_raw(build_cmd_set_device_time(now_ts), 200);
+            }
             write_ble_raw(build_cmd_get_bat(), 200);
             for (uint8_t slot = 0; slot < NUM_HW_CHANNEL_SLOTS && running_; ++slot) {
                 write_ble_raw(build_cmd_get_channel(slot), 180);
@@ -1590,6 +1769,7 @@ private:
             write_ble_raw(build_cmd_get_contacts(), 350);
             write_ble_raw(build_cmd_sync_next_message(), 200);
             last_handshake_t = std::chrono::steady_clock::now();
+            last_clock_sync = last_handshake_t;
         };
 
         auto last_auth_retry_t = std::chrono::steady_clock::now();
@@ -1689,6 +1869,7 @@ private:
             for (auto& raw_frame : pending_rx) {
                 if (raw_frame.empty()) continue;
                 got_any_rx = true;
+                last_any_rx_t = std::chrono::steady_clock::now();
                 // Strip 0x3E + 2-byte length header if a custom bridge added it; otherwise pass raw BLE NUS frame directly
                 if (raw_frame.size() >= 4 && raw_frame[0] == FRAME_INBOUND_MAGIC) {
                     uint16_t flen = static_cast<uint16_t>(raw_frame[1]) | (static_cast<uint16_t>(raw_frame[2]) << 8);
@@ -1718,6 +1899,7 @@ private:
                 if (!handshake_sent) {
                     handshake_sent = true;
                     handshake_retries = 0;
+                    last_any_rx_t = now;
                     send_full_ble_handshake();
                 } else if (!got_any_rx && handshake_retries < 5 &&
                            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_handshake_t).count() >= 3000) {
@@ -1733,15 +1915,18 @@ private:
 
                     uint64_t ok_before = 0;
                     uint64_t err_before = 0;
+                    uint64_t rx_before = 0;
                     {
                         std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
                         ok_before = g_mac_ble.ok_seq;
                         err_before = g_mac_ble.err_seq;
+                        rx_before = g_mac_ble.rx_seq;
                     }
 
                     int wait_ms = (cmd.kind == OutboundCmd::Kind::SyncSlot ||
                                    cmd.kind == OutboundCmd::Kind::SendMonoImg ||
-                                   cmd.kind == OutboundCmd::Kind::SendMsg) ? 320 : 220;
+                                   cmd.kind == OutboundCmd::Kind::SendMsg ||
+                                   cmd.kind == OutboundCmd::Kind::SendDirectMsg) ? 320 : 220;
                     if (!write_ble_raw(cmd.raw_payload, wait_ms)) {
                         // Link disconnected mid-write: preserve user message/image at front of queue for auto-reconnect
                         if (cmd.kind == OutboundCmd::Kind::SendMonoImg ||
@@ -1752,10 +1937,12 @@ private:
                         break;
                     }
 
-                    // For channel messages & 0x49 images: verify the radio acknowledged with RESP_CODE_OK (0x00).
-                    // If the BLE link was waking from idle latency or the slot needed re-syncing, automatically
-                    // program the slot and re-transmit so the packet is never lost after sitting idle.
-                    if (cmd.kind == OutboundCmd::Kind::SendMonoImg || cmd.kind == OutboundCmd::Kind::SendMsg) {
+                    // For channel messages, 0x49 images & DMs: verify the radio acknowledged with RESP_CODE_OK (0x00)
+                    // or RESP_SENT (0x06). If the BLE link was waking from multi-day idle latency or the companion
+                    // firmware session / RTC / slot needed re-syncing, self-heal and re-transmit automatically.
+                    if (cmd.kind == OutboundCmd::Kind::SendMonoImg ||
+                        cmd.kind == OutboundCmd::Kind::SendMsg ||
+                        cmd.kind == OutboundCmd::Kind::SendDirectMsg) {
                         bool got_ok = false;
                         bool got_err = false;
                         auto verify_start = std::chrono::steady_clock::now();
@@ -1764,37 +1951,113 @@ private:
                                 std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
                                 got_ok = (g_mac_ble.ok_seq > ok_before);
                                 got_err = (g_mac_ble.err_seq > err_before);
+                                if (g_mac_ble.rx_seq > rx_before) {
+                                    last_any_rx_t = std::chrono::steady_clock::now();
+                                }
                             }
                             if (got_ok || got_err) break;
                             if (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::steady_clock::now() - verify_start).count() >= 220) {
+                                    std::chrono::steady_clock::now() - verify_start).count() >= 280) {
                                 break;
                             }
                             std::this_thread::sleep_for(std::chrono::milliseconds(15));
                         }
                         if (!got_ok || got_err) {
-                            push_log("[BLE] Waking idle BLE link / syncing Slot " + std::to_string(cmd.slot_idx) +
-                                     " (" + cmd.channel_name + ") and confirming RF transmission...");
-                            if (cmd.slot_idx > 0 && !cmd.channel_name.empty()) {
-                                write_ble_raw(build_cmd_set_channel(cmd.slot_idx, cmd.channel_name, derive_psk(cmd.channel_name)), 320);
+                            push_log("[BLE] Self-healing companion session / clock / Slot " + std::to_string(cmd.slot_idx) +
+                                     " and confirming RF transmission...");
+                            write_ble_raw(build_cmd_app_start("MeshCore++"), 240);
+                            uint32_t now_ts = static_cast<uint32_t>(std::time(nullptr));
+                            if (now_ts > 1700000000u) {
+                                write_ble_raw(build_cmd_set_device_time(now_ts), 200);
                             }
-                            uint32_t retry_ts = static_cast<uint32_t>(std::time(nullptr)) + 1u;
+                            if (cmd.kind != OutboundCmd::Kind::SendDirectMsg) {
+                                if (cmd.slot_idx > 0 && !cmd.channel_name.empty()) {
+                                    write_ble_raw(build_cmd_set_channel(cmd.slot_idx, cmd.channel_name, derive_psk(cmd.channel_name)), 320);
+                                } else if (cmd.slot_idx == 0) {
+                                    write_ble_raw(build_cmd_set_channel(0, PUBLIC_CHANNEL_NAME, derive_psk(PUBLIC_CHANNEL_NAME)), 320);
+                                }
+                            }
+                            uint64_t rx_retry_before = 0;
+                            {
+                                std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                                rx_retry_before = g_mac_ble.rx_seq;
+                            }
+                            uint32_t retry_ts = now_ts + 1u;
                             std::vector<uint8_t> retry_payload =
                                 (cmd.kind == OutboundCmd::Kind::SendMonoImg)
                                     ? build_cmd_send_channel_mono_img(cmd.slot_idx, retry_ts, cmd.mono_bits)
+                                : (cmd.kind == OutboundCmd::Kind::SendDirectMsg)
+                                    ? build_cmd_send_txt_msg(cmd.pubkey_prefix, retry_ts, cmd.text, cmd.txt_type, 1)
                                     : build_cmd_send_channel_txt_msg(cmd.slot_idx, retry_ts, cmd.text);
                             write_ble_raw(retry_payload, 320);
+                            bool any_rx_after_retry = false;
+                            {
+                                std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                                any_rx_after_retry = (g_mac_ble.rx_seq > rx_retry_before);
+                                if (any_rx_after_retry) last_any_rx_t = std::chrono::steady_clock::now();
+                            }
+                            if (!any_rx_after_retry) {
+                                push_log("[BLE WATCHDOG] Companion GATT link did not respond to TX retry — re-queueing message and resetting BLE link...");
+                                cmd.raw_payload = retry_payload;
+                                requeue_cmd_front(cmd);
+                                std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                                if (g_mac_ble.central && g_mac_ble.active_peripheral) {
+                                    mac_msg_send<void>(g_mac_ble.central, sel_registerName("cancelPeripheralConnection:"), g_mac_ble.active_peripheral);
+                                }
+                                g_mac_ble.connected = false;
+                                g_mac_ble.gatt_ready = false;
+                                g_mac_ble.write_in_flight = false;
+                                g_mac_ble.disconnected_event = true;
+                                break;
+                            }
                         }
                     }
                 }
 
                 now = std::chrono::steady_clock::now();
                 if (!has_pending_cmd() &&
-                    std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 30) {
+                    std::chrono::duration_cast<std::chrono::seconds>(now - last_bat_poll).count() >= 25) {
                     last_bat_poll = now;
+                    // Refresh companion session + RTC clock every 10 minutes
+                    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_clock_sync).count() >= 600) {
+                        last_clock_sync = now;
+                        write_ble_raw(build_cmd_app_start("MeshCore++"), 200);
+                        uint32_t now_ts = static_cast<uint32_t>(std::time(nullptr));
+                        if (now_ts > 1700000000u) {
+                            write_ble_raw(build_cmd_set_device_time(now_ts), 180);
+                        }
+                    }
+                    uint64_t rx_before_hb = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                        rx_before_hb = g_mac_ble.rx_seq;
+                    }
                     write_ble_raw(build_cmd_get_bat(), 200);
                     if (!has_pending_cmd()) {
                         write_ble_raw(build_cmd_sync_next_message(), 200);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                        if (g_mac_ble.rx_seq > rx_before_hb) {
+                            last_any_rx_t = std::chrono::steady_clock::now();
+                        }
+                    }
+                    auto silence_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - last_any_rx_t).count();
+                    if (silence_secs >= 65) {
+                        push_log("[BLE WATCHDOG] No response from companion radio for " +
+                                 std::to_string(silence_secs) + "s — resetting BLE GATT connection to self-heal...");
+                        last_any_rx_t = std::chrono::steady_clock::now();
+                        std::lock_guard<std::mutex> lk(g_mac_ble.mtx);
+                        if (g_mac_ble.central && g_mac_ble.active_peripheral) {
+                            mac_msg_send<void>(g_mac_ble.central, sel_registerName("cancelPeripheralConnection:"), g_mac_ble.active_peripheral);
+                        }
+                        g_mac_ble.connected = false;
+                        g_mac_ble.gatt_ready = false;
+                        g_mac_ble.write_in_flight = false;
+                        g_mac_ble.disconnected_event = true;
+                    } else if (silence_secs >= 30) {
+                        write_ble_raw(build_cmd_device_query(), 220);
                     }
                 }
             }

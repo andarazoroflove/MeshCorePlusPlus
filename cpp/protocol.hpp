@@ -18,6 +18,7 @@ constexpr uint8_t CMD_APP_START            = 0x01;
 constexpr uint8_t CMD_SEND_TXT_MSG         = 0x02;
 constexpr uint8_t CMD_SEND_CHANNEL_TXT_MSG = 0x03;
 constexpr uint8_t CMD_GET_CONTACTS         = 0x04;
+constexpr uint8_t CMD_SET_DEVICE_TIME      = 0x06;
 constexpr uint8_t CMD_SEND_SELF_ADVERT     = 0x07;
 constexpr uint8_t CMD_SYNC_NEXT_MESSAGE    = 0x0A;
 constexpr uint8_t CMD_RESET_PATH           = 0x0D;
@@ -98,6 +99,16 @@ inline std::vector<uint8_t> build_cmd_get_contacts() {
 
 inline std::vector<uint8_t> build_cmd_sync_next_message() {
     return {CMD_SYNC_NEXT_MESSAGE};
+}
+
+inline std::vector<uint8_t> build_cmd_set_device_time(uint32_t epoch_secs) {
+    return {
+        CMD_SET_DEVICE_TIME,
+        static_cast<uint8_t>(epoch_secs & 0xFF),
+        static_cast<uint8_t>((epoch_secs >> 8) & 0xFF),
+        static_cast<uint8_t>((epoch_secs >> 16) & 0xFF),
+        static_cast<uint8_t>((epoch_secs >> 24) & 0xFF)
+    };
 }
 
 inline std::vector<uint8_t> build_cmd_send_self_advert(bool flood = true) {

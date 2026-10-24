@@ -1615,12 +1615,22 @@ public:
         }
     }
 
+    static void trim_tab_messages(ChannelTab& t, size_t max_msgs = 1000) {
+        if (t.messages.size() > max_msgs + 100) {
+            size_t drop = t.messages.size() - max_msgs;
+            t.messages.erase(t.messages.begin(), t.messages.begin() + static_cast<std::ptrdiff_t>(drop));
+        }
+    }
+
     void handle_event(const MeshEvent& ev) {
         switch (ev.type) {
             case EventType::TransportStatus:
                 transport_label = ev.status_label;
                 transport_connected = ev.connected;
                 is_sim = ev.is_sim;
+                if (ev.connected && !ev.is_sim) {
+                    hw_slots.mark_non_public_unsynced();
+                }
                 log_console("[STATUS] " + ev.status_label + (ev.connected ? " (connected)" : " (not connected)"));
                 break;
             case EventType::ConsoleLog:
@@ -1645,12 +1655,22 @@ public:
     void log_console(const std::string& text) {
         {
             static std::ofstream dbg_log(from_wide(exe_dir() + L"meshcore_session.log"), std::ios::trunc);
-            if (dbg_log) dbg_log << now_hms_str() << " " << text << std::endl;
+            static size_t dbg_lines = 0;
+            if (++dbg_lines > 25000) {
+                dbg_lines = 0;
+                dbg_log.close();
+                dbg_log.open(from_wide(exe_dir() + L"meshcore_session.log"), std::ios::trunc);
+            }
+            if (dbg_log) {
+                dbg_log << now_hms_str() << " " << text << '\n';
+                if ((dbg_lines & 0x1F) == 0) dbg_log.flush();
+            }
         }
         if (tabs.empty()) return;
         tabs[0].messages.push_back(ChatMessage{
             now_hms_str(), "SYSTEM", false, 0, 0.0f, 0, text, true, false, false
         });
+        trim_tab_messages(tabs[0], 800);
         if (active_tab_idx != 0) tabs[0].unread_count++;
     }
 
@@ -1660,6 +1680,7 @@ public:
             tabs[1].messages.push_back(ChatMessage{
                 now_hms_str(), "SYSTEM", false, 0, 0.0f, 0, text, true, false, false
             });
+            trim_tab_messages(tabs[1], 1000);
         }
     }
 
@@ -1668,6 +1689,7 @@ public:
         tabs[active_tab_idx].messages.push_back(ChatMessage{
             now_hms_str(), "*", false, 0, 0.0f, 0, text, true, false, false
         });
+        trim_tab_messages(tabs[active_tab_idx], 1000);
     }
 
     void log_all_heard(const std::string& sender,
@@ -2989,6 +3011,7 @@ public:
                 tabs[i].update_station(sender, rssi, snr, hops);
                 tabs[i].scan_text_mentions(text);
                 tabs[i].messages.push_back(msg);
+                trim_tab_messages(tabs[i], 1000);
                 if (i != active_tab_idx) {
                     tabs[i].unread_count++;
                     if (is_mention) tabs[i].has_mention = true;
@@ -3006,6 +3029,7 @@ public:
         bg.update_station(sender, rssi, snr, hops);
         bg.scan_text_mentions(text);
         bg.messages.push_back(msg);
+        trim_tab_messages(bg, 800);
         bg.unread_count++;
         if (is_mention) bg.has_mention = true;
         state_dirty = true;
@@ -3155,6 +3179,7 @@ public:
         };
         tabs[idx].update_station(sender_name, rssi, snr, hops);
         tabs[idx].messages.push_back(msg);
+        trim_tab_messages(tabs[idx], 1000);
         if (idx != active_tab_idx) {
             tabs[idx].unread_count++;
             tabs[idx].has_mention = true;
@@ -3169,6 +3194,7 @@ public:
             };
             tabs[1].update_station(sender_name, rssi, snr, hops);
             tabs[1].messages.push_back(pub_notice);
+            trim_tab_messages(tabs[1], 1000);
         }
         log_console("[DIRECT MSG from " + sender_name + "] " + display_txt);
         log_all_heard(sender_name, "[DIRECT MSG -> YOU] " + display_txt, rssi, snr, hops, false, true);
@@ -5016,29 +5042,33 @@ private:
         // 2. For Public, include EVERY heard user across all tabs, live adverts, and mesh_nodes!
         std::vector<HeardStation> room_users;
         room_users.reserve(active_tab.nicks.size() + (is_public_tab ? app.mesh_nodes.size() + 32 : 0));
-        auto has_user = [&](const std::string& name) {
-            if (name.empty() || name == "SYSTEM" || name == "*" || name == "(unnamed)" ||
-                _stricmp(name.c_str(), app.callsign.c_str()) == 0) {
+        std::unordered_set<std::string> seen_users;
+        seen_users.reserve(active_tab.nicks.size() * 2 + (is_public_tab ? app.mesh_nodes.size() * 2 + 64 : 16));
+        auto lower_key = [](const std::string& s) {
+            std::string k = s;
+            std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return k;
+        };
+        if (!app.callsign.empty()) seen_users.insert(lower_key(app.callsign));
+        auto has_or_mark_user = [&](const std::string& name) {
+            if (name.empty() || name == "SYSTEM" || name == "*" || name == "(unnamed)") {
                 return true;
             }
-            for (const auto& u : room_users) {
-                if (_stricmp(u.callsign.c_str(), name.c_str()) == 0) return true;
-            }
-            return false;
+            return !seen_users.insert(lower_key(name)).second;
         };
         for (const auto& st : active_tab.nicks) {
-            if (!has_user(st.callsign)) room_users.push_back(st);
+            if (!has_or_mark_user(st.callsign)) room_users.push_back(st);
         }
         if (is_public_tab) {
             // Include speakers from every channel / DM tab
             for (const auto& t : app.tabs) {
                 for (const auto& st : t.nicks) {
-                    if (!has_user(st.callsign)) room_users.push_back(st);
+                    if (!has_or_mark_user(st.callsign)) room_users.push_back(st);
                 }
             }
             // Include every live advert station (newest first)
             for (auto it = app.adverts.rbegin(); it != app.adverts.rend(); ++it) {
-                if (!has_user(it->name)) {
+                if (!has_or_mark_user(it->name)) {
                     HeardStation hs;
                     hs.callsign = it->name;
                     hs.last_rssi = it->rssi;
@@ -5052,7 +5082,7 @@ private:
             }
             // Include EVERY single node in mesh_nodes (Companions, Repeaters, Room Servers, Sensors)
             for (const auto& nd : app.mesh_nodes) {
-                if (!has_user(nd.name)) {
+                if (!has_or_mark_user(nd.name)) {
                     HeardStation hs;
                     hs.callsign = nd.name;
                     hs.last_rssi = nd.live_rssi;
